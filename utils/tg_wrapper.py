@@ -74,15 +74,15 @@ class TelegramReporter:
         當雷達偵測到 Z-Score 達標時發送
         包含 Stage 6 的 Beta 漂移警示
         """
-        drift_msg = f"\n⚠️ *BETA DRIFT:* `{drift:.1%}`" if drift > 0.15 else ""
+        drift_msg = f"\n⚠️ *BETA DRIFT:* '{drift:.1%}'" if drift > 0.15 else ""
 
         msg = (
             f"🎯 *SIGNAL DETECTED*\n"
             f"───────────────────\n"
-            f"📊 *Pair:* `{pair}`\n"
-            f"📉 *Z-Score:* `{z_score:+.4f}`\n"
+            f"📊 *Pair:* '{pair}'\n"
+            f"📉 *Z-Score:* '{z_score:+.4f}'\n"
             f"⚡ *Action:* {side1} Y / {side2} X\n"
-            f"🧮 *Beta:* `{beta:.4f}`{drift_msg}\n"
+            f"🧮 *Beta:* '{beta:.4f}'{drift_msg}\n"
             f"⏰ *Time:* {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"
         )
         self._send(msg)
@@ -98,10 +98,10 @@ class TelegramReporter:
         msg = (
             f"⚓ *FUNDING GUARD ALERT*\n"
             f"───────────────────\n"
-            f"📦 *Pair:* `{pair}`\n"
-            f"💰 *Current Rate:* `{current_rate:.4%}` / 8h\n"
-            f"⚠️ *Threshold:* `{threshold:.4%}` / 8h\n"
-            f"🛑 *Status:* `SIGNAL CANCELLED`\n"
+            f"📦 *Pair:* '{pair}'\n"
+            f"💰 *Current Rate:* '{current_rate:.4%}' / 8h\n"
+            f"⚠️ *Threshold:* '{threshold:.4%}' / 8h\n"
+            f"🛑 *Status:* 'SIGNAL CANCELLED'\n"
             f"🚀 _Reason: High carry cost (Interest) detected._"
         )
         self._send(msg)
@@ -114,11 +114,11 @@ class TelegramReporter:
         msg = (
             f"✅ *TRADE EXECUTED*\n"
             f"───────────────────\n"
-            f"📦 *Pair:* `{pair}`\n"
-            f"💵 *Prices:* `{p1:.4f}` | `{p2:.4f}`\n"
-            f"🔢 *Quant:* `{q1}` | `{q2}`\n"
-            f"📉 *Slippage:* `{slippage:.3%}`\n"
-            f"💰 *Wallet:* `{balance:.2f} USDT`\n"
+            f"📦 *Pair:* '{pair}'\n"
+            f"💵 *Prices:* '{p1:.4f}' | '{p2:.4f}'\n"
+            f"🔢 *Quant:* '{q1}' | '{q2}'\n"
+            f"📉 *Slippage:* '{slippage:.3%}'\n"
+            f"💰 *Wallet:* '{balance:.2f} USDT'\n"
             f"🚀 _Order status: EXECUTED via IOC_"
         )
         self._send(msg)
@@ -131,9 +131,9 @@ class TelegramReporter:
         msg = (
             f"🚨 *SYSTEM ALERT*\n"
             f"───────────────────\n"
-            f"❌ *Error:* `{error_code}`\n"
-            f"🏗️ *Module:* `{module}`\n"
-            f"⚠️ *Status:* {status}\n"
+            f"❌ *Error:* '{error_code}'\n"
+            f"🏗️ *Module:* '{module}'\n"
+            f"⚠️ *Status:* '{status}'\n"
             f"🔥 _Immediate attention required!_"
         )
         self._send(msg)
@@ -146,9 +146,9 @@ class TelegramReporter:
         msg = (
             f"💓 *HEARTBEAT PULSE*\n"
             f"───────────────────\n"
-            f"📈 *Daily PnL:* `{pnl:+.2%}`\n"
-            f"📂 *Active Pairs:* `{active_pairs}`\n"
-            f"🕒 *Uptime:* `{uptime}`\n"
+            f"📈 *Daily PnL:* '{pnl:+.2%}'\n"
+            f"📂 *Active Pairs:* '{active_pairs}'\n"
+            f"🕒 *Uptime:* '{uptime}'\n"
             f"✅ _System is breathing normally._"
         )
         self._send(msg)
@@ -166,13 +166,13 @@ class TelegramReporter:
         msg = (
             f"{status_emoji} *DAILY PERFORMANCE REPORT*\n"
             f"───────────────────\n"
-            f"💰 *Net Profit:* `{net_pnl:+.2f} USDT`\n"
-            f"📊 *Realized PnL:* `{total_pnl:+.2f}`\n"
-            f"💸 *Trading Fees:* `{fees:.2f}`\n"
-            f"⚓ *Funding Paid:* `{funding:.2f}`\n"
+            f"💰 *Net Profit:* '{net_pnl:+.2f} USDT'\n"
+            f"📊 *Realized PnL:* '{total_pnl:+.2f}'\n"
+            f"💸 *Trading Fees:* '{fees:.2f}'\n"
+            f"⚓ *Funding Paid:* '{funding:.2f}'\n"
             f"───────────────────\n"
-            f"🏆 *Win Rate:* `{win_rate:.1%}`\n"
-            f"📂 *Active Pairs:* `{active_count}`\n"
+            f"🏆 *Win Rate:* '{win_rate:.1%}'\n"
+            f"📂 *Active Pairs:* '{active_count}'\n"
             f"🕒 *Report Time:* {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
             f"🚀 _Stay disciplined, Captain._"
         )
