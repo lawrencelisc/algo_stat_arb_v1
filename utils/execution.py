@@ -35,6 +35,9 @@ class ExecutionManager:
         self.signal_file = self.root_dir / 'data' / 'signal' / 'signal_table.csv'
         self.trade_log = self.root_dir / 'data' / 'trade' / 'trade_record.csv'
 
+        self.trade_log.parent.mkdir(parents=True, exist_ok=True)
+        self.signal_file.parent.mkdir(parents=True, exist_ok=True)
+
         self.DRIFT_THRESHOLD = 0.003
         self.SLIPPAGE_TOLERANCE = 0.001
         self.MAX_RETRIES = 5
@@ -128,8 +131,11 @@ class ExecutionManager:
                 is_cost_ok, cost = self._is_funding_rate_acceptable(order['s1'], order['s2'], order['side1'], order['side2'])
                 if not is_cost_ok:
                     df.at[idx, 'status'] = 'SKIPPED_EXPENSIVE_FUNDING'
-                    # 🚀 [FIXED] 補上這行，讓 TG Bot 發送攔截警報
-                    self.tg.send_funding_alert(order['pair'], cost, self.MAX_FUNDING_DAILY / 3)
+                    self.tg.send_funding_alert(
+                        order['pair'],
+                        cost,
+                        self.MAX_FUNDING_DAILY / 3
+                    )
                     logger.warning(f"🚫 [FUNDING GUARD] Intercepted {order['pair']} due to high cost: {cost:.4%}")
                     continue
 
@@ -148,8 +154,14 @@ class ExecutionManager:
         if not is_ready:
             df.at[idx, 'status'] = 'SKIPPED_STALE'
             return False
+
         q1, q2 = self._calculate_aligned_quantities(order['s1'], order['s2'], p1, p2, order['beta'])
-        if q1 is None: return False
+
+        if q1 is None:
+            df.at[idx, 'status'] = 'SKIPPED_MIN_QTY'
+            logger.warning(f"⚠️ {order['pair']} skipped: Notional value < 10 USDT.")
+            return False
+
         success = self._fire_dual_ioc_orders(order, q1, q2, p1, p2)
         if success:
             df.at[idx, 'status'] = 'EXECUTED'
@@ -183,22 +195,30 @@ class ExecutionManager:
         s1_side, s2_side = order['side1'].lower(), order['side2'].lower()
         lp1 = p1 * (1 + self.SLIPPAGE_TOLERANCE) if s1_side == 'buy' else p1 * (1 - self.SLIPPAGE_TOLERANCE)
         lp2 = p2 * (1 + self.SLIPPAGE_TOLERANCE) if s2_side == 'buy' else p2 * (1 - self.SLIPPAGE_TOLERANCE)
+
         def place():
             sym1 = f"{order['s1'].replace('USDT', '')}/USDT:USDT"
             sym2 = f"{order['s2'].replace('USDT', '')}/USDT:USDT"
-            self.exchange.create_order(sym1, 'limit', s1_side, q1, lp1, {'timeInForce': 'IOC'})
-            self.exchange.create_order(sym2, 'limit', s2_side, q2, lp2, {'timeInForce': 'IOC'})
+
+            params1 = {'timeInForce': 'IOC', 'positionIdx': 1 if s1_side == 'buy' else 2}
+            params2 = {'timeInForce': 'IOC', 'positionIdx': 1 if s2_side == 'buy' else 2}
+
+            self.exchange.create_order(sym1, 'limit', s1_side, q1, lp1, params1)
+            self.exchange.create_order(sym2, 'limit', s2_side, q2, lp2, params2)
             return True
+
         return self._api_call_with_retry(place)
 
     def _calculate_aligned_quantities(self, s1, s2, p1, p2, beta):
         try:
             qty1 = self.budget_per_pair / p1
-            qty2 = qty1 * abs(float(beta)) * (p1 / p2)
+            qty2 = qty1 * abs(float(beta))
+
             sym1 = f"{s1.replace('USDT', '')}/USDT:USDT"
             sym2 = f"{s2.replace('USDT', '')}/USDT:USDT"
             aq1 = float(self.exchange.amount_to_precision(sym1, qty1))
             aq2 = float(self.exchange.amount_to_precision(sym2, qty2))
+
             if (aq1 * p1 < 10.0) or (aq2 * p2 < 10.0): return None, None
             return aq1, aq2
         except: return None, None
@@ -266,9 +286,18 @@ class ExecutionManager:
             contracts = float(pos['contracts'])
             if contracts > 0:
                 side = 'sell' if pos['side'] == 'long' else 'buy'
-                self.exchange.create_order(pos['symbol'], 'market', side, contracts)
+                pos_idx = 1 if pos['side'] == 'long' else 2
+                self.exchange.create_order(
+                    pos['symbol'],
+                    'market',
+                    side,
+                    contracts,
+                    params={'positionIdx': pos_idx}
+                )
+
         if self.trade_log.exists():
             df = pd.read_csv(self.trade_log)
             df.loc[df['status'] == 'OPEN', 'status'] = 'FORCE_CLOSED'
             df.to_csv(self.trade_log, index=False)
+
         self.tg.send_error_alert("KILL SWITCH ACTIVATED", "ExecutionManager", "ALL POSITIONS CLOSED")
