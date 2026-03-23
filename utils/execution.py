@@ -192,22 +192,52 @@ class ExecutionManager:
         return p1, p2, (p1 is not None and p2 is not None)
 
     def _fire_dual_ioc_orders(self, order, q1, q2, p1, p2):
+        """執行雙邊 Limit IOC 訂單 (具備單腳風險自癒防禦)"""
         s1_side, s2_side = order['side1'].lower(), order['side2'].lower()
         lp1 = p1 * (1 + self.SLIPPAGE_TOLERANCE) if s1_side == 'buy' else p1 * (1 - self.SLIPPAGE_TOLERANCE)
         lp2 = p2 * (1 + self.SLIPPAGE_TOLERANCE) if s2_side == 'buy' else p2 * (1 - self.SLIPPAGE_TOLERANCE)
 
-        def place():
-            sym1 = f"{order['s1'].replace('USDT', '')}/USDT:USDT"
-            sym2 = f"{order['s2'].replace('USDT', '')}/USDT:USDT"
+        sym1 = f"{order['s1'].replace('USDT', '')}/USDT:USDT"
+        sym2 = f"{order['s2'].replace('USDT', '')}/USDT:USDT"
 
-            params1 = {'timeInForce': 'IOC', 'positionIdx': 1 if s1_side == 'buy' else 2}
-            params2 = {'timeInForce': 'IOC', 'positionIdx': 1 if s2_side == 'buy' else 2}
+        # 1. 獨立發送第一隻腳
+        logger.info(f"Firing Leg 1: {sym1} {s1_side} {q1}")
+        res1 = self._api_call_with_retry(self.exchange.create_order, sym1, 'limit', s1_side, q1, lp1,
+                                         {'timeInForce': 'IOC'})
 
-            self.exchange.create_order(sym1, 'limit', s1_side, q1, lp1, params1)
-            self.exchange.create_order(sym2, 'limit', s2_side, q2, lp2, params2)
+        # 2. 獨立發送第二隻腳
+        logger.info(f"Firing Leg 2: {sym2} {s2_side} {q2}")
+        res2 = self._api_call_with_retry(self.exchange.create_order, sym2, 'limit', s2_side, q2, lp2,
+                                         {'timeInForce': 'IOC'})
+
+        # 3. 雙邊皆成功
+        if res1 and res2:
             return True
 
-        return self._api_call_with_retry(place)
+        # 4. 🚨 發生單腳風險 (Leg Risk)！執行緊急自癒平倉
+        logger.critical(f"🚨 [EXECUTION] Leg Risk detected for {order['pair']}! Initiating auto-close for orphaned leg.")
+
+        if res1 and not res2:
+            # 只有 sym1 成功，將其反向市價平倉
+            close_side = 'sell' if s1_side == 'buy' else 'buy'
+            try:
+                self.exchange.create_order(sym1, 'market', close_side, q1)
+                logger.info(f"🛡️ Auto-closed orphaned leg: {sym1}")
+                self.tg.send_error_alert(f"Leg Risk Auto-Healed", "ExecutionManager", f"Closed orphaned {sym1}")
+            except Exception as e:
+                logger.error(f"❌ Failed to close orphaned leg {sym1}: {e}")
+
+        elif res2 and not res1:
+            # 只有 sym2 成功，將其反向市價平倉
+            close_side = 'sell' if s2_side == 'buy' else 'buy'
+            try:
+                self.exchange.create_order(sym2, 'market', close_side, q2)
+                logger.info(f"🛡️ Auto-closed orphaned leg: {sym2}")
+                self.tg.send_error_alert(f"Leg Risk Auto-Healed", "ExecutionManager", f"Closed orphaned {sym2}")
+            except Exception as e:
+                logger.error(f"❌ Failed to close orphaned leg {sym2}: {e}")
+
+        return False
 
     def _calculate_aligned_quantities(self, s1, s2, p1, p2, beta):
         try:
