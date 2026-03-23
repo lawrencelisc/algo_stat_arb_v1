@@ -1,0 +1,8 @@
+ccxt
+pyyaml
+pandas
+numpy
+schedule
+loguru
+pyarrow
+statsmodels
