@@ -22,14 +22,18 @@ except ImportError as e:
 
 class ExecutionManager:
     """
-    Industrial Grade Execution Engine v2.2 (Optimized)
+    Industrial Grade Execution Engine v2.3-Stable (Optimized)
     Functional Features:
         1. Triple-Step Defense (VWAP, Drift, IOC)
         2. Automatic Reconciliation & Position Audit
         3. Telegram Real-time Reporting & Funding Guard
         4. [NEW] Strategy 1: Time-based Exit (3x Half-life Reversion)
         5. [NEW] Strategy 2: Profit Guard Kill Switch (HWM Protection)
+        6. [NEW] Targeted Close for single pairs
     """
+
+    # [新增] 系統版本號
+    VERSION = "v2.3.0-Stable"
 
     def __init__(self, budget_per_pair=100.0):
         # 1. Resource & Path Definitions
@@ -40,7 +44,7 @@ class ExecutionManager:
         self.vault_dir = self.root_dir / 'data' / 'vault'
         self.hwm_file = self.vault_dir / 'equity_hwm.json'
 
-        # Ensure directories exist
+        # Ensure directories exist (防呆機制)
         self.trade_log.parent.mkdir(parents=True, exist_ok=True)
         self.signal_file.parent.mkdir(parents=True, exist_ok=True)
         self.vault_dir.mkdir(parents=True, exist_ok=True)
@@ -52,6 +56,8 @@ class ExecutionManager:
         self.MAX_FUNDING_DAILY = 0.0003  # 0.03% daily funding cost limit
 
         self.tg = TelegramReporter()
+
+        logger.info(f"🚀 Initializing ExecutionManager {self.VERSION}")
         self._init_exchange()
 
     def _init_exchange(self):
@@ -66,7 +72,7 @@ class ExecutionManager:
                 'options': {'defaultType': 'linear'}
             })
             self.exchange.load_markets()
-            logger.info("📡 Execution environment synchronized.")
+            logger.info(f"📡 Execution environment synchronized. Version: {self.VERSION}")
         except Exception as e:
             logger.error(f"❌ Exchange initialization failed: {e}")
             self.exchange = None
@@ -83,7 +89,7 @@ class ExecutionManager:
         return None
 
     # ==========================================
-    # 🛡️ [NEW] Strategy 2: Profit Guard (HWM)
+    # 🛡️ [手術 4] Strategy 2: Profit Guard (HWM)
     # ==========================================
     def check_profit_guard(self, current_equity, drawdown_limit=100.0):
         """
@@ -92,32 +98,38 @@ class ExecutionManager:
         """
         try:
             max_equity = current_equity
+
+            # 安全讀取 JSON
             if self.hwm_file.exists():
-                with open(self.hwm_file, 'r') as f:
-                    data = json.load(f)
-                    max_equity = data.get("max_equity", current_equity)
+                try:
+                    with open(self.hwm_file, 'r') as f:
+                        data = json.load(f)
+                        max_equity = data.get("max_equity", current_equity)
+                except json.JSONDecodeError:
+                    logger.warning("⚠️ Vault JSON corrupted. Rebuilding...")
 
             # Update Peak if we reach new heights
             if current_equity > max_equity:
                 max_equity = current_equity
                 with open(self.hwm_file, 'w') as f:
-                    json.dump({"max_equity": max_equity, "timestamp": str(datetime.now())}, f)
+                    json.dump({"max_equity": max_equity, "timestamp": str(datetime.now(timezone.utc))}, f)
                 logger.info(f"🚀 New High-Water Mark set: {max_equity:.2f} USDT")
                 return False
 
-                # Trigger Kill Switch if drawdown from peak exceeds limit
+            # Trigger Kill Switch if drawdown from peak exceeds limit
             drawdown = max_equity - current_equity
             if drawdown >= drawdown_limit:
                 logger.critical(f"🚨 [PROFIT GUARD] Drawdown {drawdown:.2f}U detected from peak {max_equity:.2f}U!")
                 self._emergency_market_close()
                 return True
+
             return False
         except Exception as e:
             logger.error(f"❌ Profit Guard check failed: {e}")
             return False
 
     # ==========================================
-    # ⏳ [NEW] Strategy 1: Time-based Exit
+    # ⏳ [手術 1] Strategy 1: Time-based Exit
     # ==========================================
     def check_time_exit(self, pair, entry_time_str, half_life, unrealized_pnl):
         """
@@ -125,12 +137,15 @@ class ExecutionManager:
         Improves capital turnover by closing 'stale' positions.
         """
         try:
+            # 防呆：如果 half_life 數據異常，給予預設值 8.0
+            hl_value = float(half_life) if pd.notna(half_life) and float(half_life) > 0 else 8.0
+
             entry_time = datetime.strptime(entry_time_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
             now = datetime.now(timezone.utc)
             duration_hours = (now - entry_time).total_seconds() / 3600
 
             # Threshold: 3x Half-life
-            time_limit = half_life * 3
+            time_limit = hl_value * 3
 
             if duration_hours > time_limit and unrealized_pnl > 0:
                 logger.info(
@@ -139,6 +154,50 @@ class ExecutionManager:
             return False
         except Exception as e:
             logger.error(f"❌ Time-exit check failed for {pair}: {e}")
+            return False
+
+    # ==========================================
+    # 🎯 [新增功能] 針對單一組合精準平倉
+    # ==========================================
+    def close_specific_pair(self, pair_name, reason="TIME_EXIT"):
+        """Safely closes a single pair instead of emergency closing everything."""
+        logger.info(f"✂️ Initiating targeted close for {pair_name} (Reason: {reason})")
+        try:
+            if not self.trade_log.exists(): return False
+            df = pd.read_csv(self.trade_log)
+            trade_idx = df[(df['pair'] == pair_name) & (df['status'] == 'OPEN')].index
+
+            if trade_idx.empty:
+                logger.warning(f"⚠️ Cannot find OPEN record for {pair_name} in trade log.")
+                return False
+
+            trade = df.loc[trade_idx[0]]
+
+            # Fetch active positions from exchange to ensure we have it
+            positions = self._api_call_with_retry(self.exchange.fetch_positions, params={'category': 'linear'})
+            if not positions: return False
+
+            s1_sym = f"{trade['s1'].replace('USDT', '')}/USDT:USDT"
+            s2_sym = f"{trade['s2'].replace('USDT', '')}/USDT:USDT"
+
+            closed_legs = 0
+            for pos in positions:
+                if pos['symbol'] in [s1_sym, s2_sym] and float(pos['contracts']) > 0:
+                    close_side = 'sell' if pos['side'] == 'long' else 'buy'
+                    self._api_call_with_retry(self.exchange.create_order, pos['symbol'], 'market', close_side,
+                                              float(pos['contracts']))
+                    closed_legs += 1
+
+            if closed_legs > 0:
+                # Update log
+                df.loc[trade_idx, 'status'] = f'CLOSED_{reason}'
+                df.to_csv(self.trade_log, index=False)
+                logger.success(f"✅ Successfully closed specific pair {pair_name} due to {reason}")
+                return True
+
+            return False
+        except Exception as e:
+            logger.error(f"❌ Failed to close specific pair {pair_name}: {e}")
             return False
 
     def reconcile_positions(self):
