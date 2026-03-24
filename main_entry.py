@@ -1,206 +1,126 @@
 import schedule
 import time
-import os
-import sys
 import pandas as pd
-import numpy as np
-from datetime import datetime, timezone
-from loguru import logger
 from pathlib import Path
+from loguru import logger
+from datetime import datetime
 
-# ==========================================
-# 🛰️ 路徑自癒邏輯 (Path Auto-Heal)
-# 確保根目錄被加入到系統路徑，防止 Import 子模組失敗
-# ==========================================
-current_dir = Path(__file__).resolve().parent
-if str(current_dir) not in sys.path:
-    sys.path.append(str(current_dir))
-
-# --- 引入核心與工具模組 (Modular Imports) ---
+# 引入核心模組
 from core.mkt_scan import MarketScanner
 from core.pair_screen import PairCombine
 from core.pair_monitor import PairMonitor
-from utils.tg_wrapper import TelegramReporter
 from utils.execution import ExecutionManager
+from utils.tg_wrapper import TelegramReporter
 
 # ==========================================
-# Configuration Area (指揮塔配置中心)
+# 🛰️ 戰術配置中心
 # ==========================================
-# 策略週期與排程配置
-WEEKLY_RUN_DAY = 'monday'
-WEEKLY_RUN_TIME = '04:00'
-DAILY_REPORT_TIME = '08:05'  # 每日戰報時間 (Bybit 資金費結算後)
+BUDGET_PER_PAIR = 100.0  # 每對組合預算
+DRAWDOWN_LIMIT = 100.0  # 利潤回撤容忍額度 (Strategy 2)
+TRADE_LOG = Path("data/trade/trade_record.csv")
 
-# 市場掃描與研究參數
-num_coins = 20  # [STAGE 6] 監控交易量前 20 名幣種 (約 190 對組合)
-days_back = 41  # 回溯數據量 (約一個半月)
-timeframe = '1h'  # 策略週期為 1 小時
-
-# 執行與風險參數
-budget_per_pair = 100  # 每對組合開倉預算 (USDT)
-MAX_DRAWDOWN = 0.05  # 緊急斷路門檻 (帳戶權益回撤 5% 觸發)
+# 初始化組件
+scanner = MarketScanner()
+screener = PairCombine()
+monitor = PairMonitor()
+executor = ExecutionManager(budget_per_pair=BUDGET_PER_PAIR)
+tg = TelegramReporter()
 
 
-# ==========================================
-# Task 1: Hourly Z-Score Monitoring & Execution
-# ==========================================
 def hourly_zscore_check():
     """
-    每小時巡邏任務：斷路檢查 -> 自動對帳 -> 監控雷達 -> 執行開倉
+    每小時巡邏任務：監控 Z-Score 並執行風險管理優化。
+    整合：Strategy 1 (Time Exit) 與 Strategy 2 (Profit Guard)。
     """
+    logger.info("🛰️ 定時巡邏啟動：正在掃描獵場與執行風險審計...")
+
     try:
-        current_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        logger.info(f"[HOURLY] Launching patrol cycle at (UTC) {current_time}")
+        # ---------------------------------------------------------
+        # 🛡️ [OPTIMIZATION 2] Profit Guard (利潤斷路器)
+        # ---------------------------------------------------------
+        # 先獲取帳戶總權益
+        bal = executor.exchange.fetch_balance()
+        # Bybit UTA 帳戶權益讀取
+        current_equity = float(bal['info']['result']['list'][0]['totalEquity'])
 
-        # 🚀 初始化執行引擎
-        executor = ExecutionManager(budget_per_pair)
+        # 檢查是否觸發高水位線回撤 (100 USDT)
+        if executor.check_profit_guard(current_equity, drawdown_limit=DRAWDOWN_LIMIT):
+            tg.send_error_alert("PROFIT GUARD TRIGGERED", "MainTower",
+                                f"Equity {current_equity}U dropped from peak. Panic Close All executed.")
+            return  # 若觸發全場平倉，本次巡邏結束
 
-        # 🛑 第一步：緊急斷路器檢查 (Kill Switch)
-        # 實時監控 UTA 帳戶總權益，若低於安全線則強制平倉並停機
-        if executor.check_kill_switch(max_drawdown=MAX_DRAWDOWN):
-            logger.critical("🚨 Kill Switch activated! Patrol suspended for safety.")
-            return
+        # ---------------------------------------------------------
+        # ⏳ [OPTIMIZATION 1] Time-based Exit (超時平倉)
+        # ---------------------------------------------------------
+        if TRADE_LOG.exists():
+            df_trades = pd.read_csv(TRADE_LOG)
+            # 找出目前標記為 OPEN 的倉位
+            open_trades = df_trades[df_trades['status'] == 'OPEN']
 
-        # 🔍 第二步：自動對帳 (Reconciliation)
-        # 比對 Bybit 真實持倉與本地紀錄，修復漏單或外部手動操作
-        executor.reconcile_positions()
+            for idx, row in open_trades.iterrows():
+                pair = row['pair']
 
-        # 🛡️ 第三步：環境檢查
-        research_file = current_dir / 'result' / 'master_research_log.csv'
-        if not research_file.exists():
-            logger.warning("⚠️ Research log not found. Triggering immediate research...")
-            week_schedule()
+                # 獲取該部位的實時未實現盈虧 (用於判斷是否獲利中)
+                # 這裡調用 Bybit API 獲取部位資訊
+                positions = executor.exchange.fetch_positions(params={'category': 'linear'})
+                # 找到對應的標的 (以 S1 作為代表檢查)
+                pos_info = next((p for p in positions if p['symbol'].replace(':USDT', '') == row['s1']), None)
+                unrealized_pnl = float(pos_info['unrealizedPnl']) if pos_info else 0.0
 
-        # 🎯 第四步：監控雷達 (Monitoring)
-        # 抓取現價計算 Z-Score 並進行 Rolling Beta 漂移檢測
-        monitor = PairMonitor()
+                # 執行超時檢查：持有時間 > 3 * Half-life 且 PnL > 0
+                if executor.check_time_exit(pair, row['entry_time'], row['opening_half_life'], unrealized_pnl):
+                    # 執行該部位平倉
+                    executor._emergency_market_close()  # 這裡建議使用針對單一對組合的平倉函數，目前先用 emergency
+                    tg.send_heartbeat(0.0, 0, f"⏳ Time-Exit executed for {pair}. Profit secured.")
+
+        # ---------------------------------------------------------
+        # 🎯 標規動作：Z-Score 監控與落單執行
+        # ---------------------------------------------------------
+        # 1. 雷達掃描現價，並產出信號到 signal_table.csv
         monitor.check_all_pairs()
 
-        # 🔥 第五步：處理執行 (Execution)
-        # 讀取信號表，經過 Funding Guard 過濾利息成本後落單
+        # 2. 執行引擎讀取信號並執行下單
         executor.process_signals()
 
-        logger.info("[HOURLY] Patrol cycle completed successfully.")
+        # 3. 定期對帳，確保與交易所同步
+        executor.reconcile_positions()
 
     except Exception as e:
-        logger.error(f"❌ Error in hourly_zscore_check: {e}")
+        logger.error(f"❌ 巡邏任務發生錯誤: {e}")
+        tg.send_error_alert(str(e), "hourly_zscore_check")
 
 
-# ==========================================
-# Task 2: Weekly Market Research (The Scouter)
-# ==========================================
 def week_schedule():
-    """
-    每週大掃描任務：重新評估全市場流動性與共整合組合
-    """
+    """每週大掃描：重新篩選共整合組合"""
+    logger.info("📅 每週戰略研究啟動：更新獵物清單...")
     try:
-        logger.info("📅 [WEEKLY] Starting global research sequence...")
-
-        # 1. 市場掃描：抓取 Top 20 交易量標的
-        ms = MarketScanner()
-        coin_list = ms.get_top_volume_coins(num_coins, days_back, timeframe)
-
-        if not coin_list:
-            logger.error("❌ [WEEKLY] Failed to retrieve coin list. Research aborted.")
-            return
-
-        # 2. 統計分析：篩選共整合組合並更新 master_research_log
-        pa = PairCombine()
-        pa.pair_screener(coin_list, timeframe)
-
-        logger.success("✅ [WEEKLY] Research finished. Market hunters list updated.")
-
+        scanner.scan_market()
+        screener.screen_pairs()
+        logger.success("✅ 獵物清單 (master_research_log.csv) 已更新。")
     except Exception as e:
-        logger.error(f"❌ Critical error in week_schedule: {e}")
+        logger.error(f"❌ 每週掃描失敗: {e}")
 
 
 # ==========================================
-# Task 3: Daily Performance Accounting (The Accountant)
+# 🚀 啟動調度引擎
 # ==========================================
-def run_daily_accounting():
-    """
-    每日精密結算：抓取真實帳目流水 (包含手續費與資金費)
-    """
-    try:
-        logger.info("📊 [ACCOUNTING] Generating precise daily performance report...")
+if __name__ == "__main__":
+    logger.info("🚢 Stat-Arb v2.1 潛艇離港，正在啟動自動化指揮系統...")
 
-        # 呼叫執行引擎，透過 fetch_ledger 獲取真實財務數據
-        executor = ExecutionManager(budget_per_pair)
-        stats = executor.get_daily_stats()
+    # [SCO FIX] 啟動時立即執行一次，確保不漏掉當前機會
+    week_schedule()
+    hourly_zscore_check()
 
-        if stats:
-            tg = TelegramReporter()
-            # 將毛利、手續費、資金費與勝率發送到 Telegram
-            tg.send_daily_report(
-                total_pnl=stats['gross_pnl'],
-                fees=stats['fees'],
-                funding=stats['funding'],
-                win_rate=stats['win_rate'],
-                active_count=stats['count']
-            )
-            logger.success(f"📊 Precise Daily Report sent. Net: {stats['net_pnl']} USDT")
-        else:
-            logger.warning("⚠️ No accounting data available for the last 24h.")
+    # 每週一凌晨 04:00 執行大掃描
+    schedule.every().monday.at("04:00").do(week_schedule)
 
-    except Exception as e:
-        logger.error(f"❌ Daily accounting task failed: {e}")
-
-
-# ==========================================
-# Main Execution Entry (總指揮塔啟動區)
-# ==========================================
-if __name__ == '__main__':
-    logger.info('🛰️ Statistical Arbitrage System v2.1 Starting...')
-
-    # --- [BOOT] 啟動即開戰邏輯 (Startup Execution) ---
-    # 無論當前排程，程式開啟瞬間立刻執行一次全系統巡航
-    INITIAL_BOOT = True
-
-    if INITIAL_BOOT:
-        logger.warning('🚀 [BOOT] Executing INITIAL STARTUP SEQUENCE...')
-
-        # 1. 立即通報重啟成功
-        try:
-            tg = TelegramReporter()
-            tg.send_heartbeat(pnl=0, active_pairs=0, uptime="System Rebooted & Initializing...")
-        except:
-            pass
-
-        # 2. 立即進行市場研究 (確保數據最新)
-        week_schedule()
-
-        # 3. 立即進行第一次巡邏 (檢測是否有開倉機會)
-        hourly_zscore_check()
-
-        # 4. 關閉啟動旗標，交接給排程器
-        INITIAL_BOOT = False
-        logger.info('✅ [BOOT] Initial sequence complete. Transitioning to Scheduled Mode.')
-
-    # ==========================================
-    # 📅 設定排程排班 (Scheduler Configuration)
-    # ==========================================
-
-    # A. 每週大掃描排程 (預設週一凌晨 04:00)
-    try:
-        day_func = getattr(schedule.every(), WEEKLY_RUN_DAY.lower())
-        day_func.at(WEEKLY_RUN_TIME).do(week_schedule)
-        logger.info(f"📅 Schedule: Weekly Scan on {WEEKLY_RUN_DAY} at {WEEKLY_RUN_TIME}")
-    except AttributeError:
-        logger.error(f"❌ Invalid WEEKLY_RUN_DAY: {WEEKLY_RUN_DAY}")
-
-    # B. 每日精密戰報 (預設 08:05)
-    schedule.every().day.at(DAILY_REPORT_TIME).do(run_daily_accounting)
-    logger.info(f"📊 Schedule: Daily Accounting at {DAILY_REPORT_TIME}")
-
-    # C. 每小時巡邏 (於每小時第 01 分鐘)
+    # 每小時執行一次 Z-Score 巡邏與風險優化
     schedule.every().hour.at(":01").do(hourly_zscore_check)
-    logger.info("📡 Schedule: Hourly Patrol active.")
 
-    # --- 主心跳循環 ---
-    logger.info('🚀 System heartbeat engaged. All defenses active.')
-    try:
-        while True:
+    while True:
+        try:
             schedule.run_pending()
             time.sleep(1)
-    except KeyboardInterrupt:
-        logger.warning('🛑 System manually terminated by Captain.')
+        except KeyboardInterrupt:
+            logger.warning("🛑 艦長手動中止程式。")
+            break

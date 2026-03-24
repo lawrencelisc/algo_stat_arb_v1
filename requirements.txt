@@ -6,3 +6,6 @@ schedule
 loguru
 pyarrow
 statsmodels
+streamlit
+plotly
+pathlib
