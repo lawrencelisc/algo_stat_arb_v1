@@ -58,30 +58,35 @@ def hourly_zscore_check():
         # ⏳ [OPTIMIZATION 1] Time-based Exit (超時平倉)
         # ---------------------------------------------------------
         if TRADE_LOG.exists():
-            df_trades = pd.read_csv(TRADE_LOG)
-            open_trades = df_trades[df_trades['status'] == 'OPEN']
+            try:
+                df_trades = pd.read_csv(TRADE_LOG)
+                open_trades = df_trades[df_trades['status'] == 'OPEN']
 
-            if not open_trades.empty:
-                logger.info(f"🔎 正在檢查 {len(open_trades)} 個活動持倉的持有時間...")
-                positions = executor.exchange.fetch_positions(params={'category': 'linear'})
+                if not open_trades.empty:
+                    logger.info(f"🔎 正在檢查 {len(open_trades)} 個活動持倉的持有時間...")
+                    positions = executor.exchange.fetch_positions(params={'category': 'linear'})
 
-                for idx, row in open_trades.iterrows():
-                    pair = row['pair']
+                    for idx, row in open_trades.iterrows():
+                        pair = row['pair']
 
-                    # ⚠️ 防呆機制：相容舊帳本，如果沒有 opening_half_life 就預設為 8.0
-                    half_life = row.get('opening_half_life', 8.0)
-                    if pd.isna(half_life):
-                        half_life = 8.0
+                        # ⚠️ 防呆機制：相容舊帳本，如果沒有 opening_half_life 就預設為 8.0
+                        half_life = row.get('opening_half_life', 8.0)
+                        if pd.isna(half_life):
+                            half_life = 8.0
 
-                    pos_info = next((p for p in positions if p['symbol'].replace(':USDT', '') == row['s1']), None)
-                    unrealized_pnl = float(pos_info['unrealizedPnl']) if pos_info else 0.0
+                        pos_info = next((p for p in positions if p['symbol'].replace(':USDT', '') == row['s1']), None)
+                        unrealized_pnl = float(pos_info['unrealizedPnl']) if pos_info else 0.0
 
-                    # 檢查是否超時
-                    if executor.check_time_exit(pair, row['entry_time'], float(half_life), unrealized_pnl):
-                        # ✅ v2.3 精準平倉：只平嗰一對，唔會誤傷其他！
-                        success = executor.close_specific_pair(pair, reason="TIME_EXIT")
-                        if success:
-                            tg.send_heartbeat(0.0, 0, f"⏳ Time-Exit executed for {pair}. Profit secured.")
+                        # 檢查是否超時
+                        if executor.check_time_exit(pair, row['entry_time'], float(half_life), unrealized_pnl):
+                            # ✅ v2.3 精準平倉：只平嗰一對，唔會誤傷其他！
+                            success = executor.close_specific_pair(pair, reason="TIME_EXIT")
+                            if success:
+                                tg.send_heartbeat(0.0, 0, f"⏳ Time-Exit executed for {pair}. Profit secured.")
+            except pd.errors.ParserError:
+                logger.error("❌ trade_record.csv 格式錯誤，可能包含新舊混雜欄位。請刪除或備份該檔案。")
+            except Exception as e:
+                logger.error(f"❌ Time Exit 執行異常: {e}")
 
         # ---------------------------------------------------------
         # 🎯 標規動作：Z-Score 監控與落單執行
@@ -99,14 +104,24 @@ def week_schedule():
     """每週大掃描：重新篩選共整合組合"""
     logger.info("📅 每週戰略研究啟動：更新獵物清單...")
     try:
-        # ⚠️ 注意：如果您的 MarketScanner 函數唔係叫 scan_market()，請喺度修改
-        if hasattr(scanner, 'scan_market'):
-            scanner.scan_market()
-        elif hasattr(scanner, 'run'):
-            scanner.run()
+        # 🛡️ 智能探測：自動尋找 MarketScanner 內可用的執行函數
+        scan_method = getattr(scanner, 'scan_market', getattr(scanner, 'run', getattr(scanner, 'execute',
+                                                                                      getattr(scanner, 'fetch_data',
+                                                                                              None))))
+        if callable(scan_method):
+            scan_method()
+        else:
+            logger.warning("⚠️ 找不到 MarketScanner 的執行函數，請確認 core/mkt_scan.py 的函數名稱。")
 
-        if hasattr(screener, 'screen_pairs'):
-            screener.screen_pairs()
+        # 🛡️ 智能探測：自動尋找 PairCombine 內可用的執行函數
+        screen_method = getattr(screener, 'screen_pairs', getattr(screener, 'run', getattr(screener, 'execute',
+                                                                                           getattr(screener, 'analyze',
+                                                                                                   None))))
+        if callable(screen_method):
+            screen_method()
+        else:
+            logger.warning("⚠️ 找不到 PairCombine 的執行函數，請確認 core/pair_screen.py 的函數名稱。")
+
         logger.success("✅ 獵物清單 (master_research_log.csv) 已更新。")
     except Exception as e:
         logger.error(f"❌ 每週掃描失敗: {e}")

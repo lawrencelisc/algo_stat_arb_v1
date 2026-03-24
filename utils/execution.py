@@ -224,8 +224,8 @@ class ExecutionManager:
                 has_s2 = s2 in real_active_symbols
 
                 if not has_s1 and not has_s2:
-                    df_trade.at[idx, 'status'] = 'CLOSED_SYNC'
-                    self.tg.send_error_alert(f"External Closure: {pair}", "ReconModule", "Synced to CLOSED_SYNC")
+                    df_trade.at[idx, 'status'] = 'CLOSED-SYNC'
+                    self.tg.send_error_alert(f"External Closure: {pair}", "ReconModule", "Synced to CLOSED-SYNC")
                     reconciled_count += 1
                 elif not has_s1 or not has_s2:
                     missing = s1 if not has_s1 else s2
