@@ -10,7 +10,7 @@ from streamlit_autorefresh import st_autorefresh
 # ==========================================
 # 🛰️ 網頁配置與自定義 CSS
 # ==========================================
-VERSION = "v2.5.5-Stable"
+VERSION = "v2.5.6-Stable"
 
 st.set_page_config(
     page_title=f"Stat-Arb {VERSION} UI",
@@ -106,37 +106,68 @@ if not display_df.empty:
     live_prices = fetch_live_prices(unique_symbols)
 
     live_pnl_list = []
+    time_left_list = []
+
+    # 計算當前 UTC 時間以比對 Time-Exit
+    current_utc_time = pd.Timestamp.utcnow()
+
     for idx, row in display_df.iterrows():
+        # --- 1. 計算 Live PnL ---
         try:
             z_val = row['Current Z']
             if pd.isna(z_val):
                 live_pnl_list.append(None)
-                continue
-            z_val = float(z_val)
-
-            cp1 = live_prices.get(row['s1'])
-            cp2 = live_prices.get(row['s2'])
-
-            if cp1 is not None and cp2 is not None:
-                ep1, ep2 = float(row['price1']), float(row['price2'])
-                q1, q2 = float(row['qty1']), float(row['qty2'])
-
-                # 透過 Z-Score 正負號判斷多空方向 (Z>0: Short s1/Long s2, Z<0: Long s1/Short s2)
-                if z_val > 0:
-                    pnl = (ep1 - cp1) * q1 + (cp2 - ep2) * q2
-                else:
-                    pnl = (cp1 - ep1) * q1 + (ep2 - cp2) * q2
-
-                live_pnl_list.append(pnl)
-                total_floating_pnl += pnl
             else:
-                live_pnl_list.append(None)
+                z_val = float(z_val)
+                cp1 = live_prices.get(row['s1'])
+                cp2 = live_prices.get(row['s2'])
+
+                if cp1 is not None and cp2 is not None:
+                    ep1, ep2 = float(row['price1']), float(row['price2'])
+                    q1, q2 = float(row['qty1']), float(row['qty2'])
+
+                    # 透過 Z-Score 正負號判斷多空方向 (Z>0: Short s1/Long s2, Z<0: Long s1/Short s2)
+                    if z_val > 0:
+                        pnl = (ep1 - cp1) * q1 + (cp2 - ep2) * q2
+                    else:
+                        pnl = (cp1 - ep1) * q1 + (ep2 - cp2) * q2
+
+                    live_pnl_list.append(pnl)
+                    total_floating_pnl += pnl
+                else:
+                    live_pnl_list.append(None)
         except Exception:
             live_pnl_list.append(None)
+
+        # --- 2. 計算 Time-Exit 剩餘時間 ---
+        try:
+            # 確保 entry_time 具備時區資訊 (UTC)
+            entry_t = pd.Timestamp(row['entry_time'])
+            if entry_t.tz is None:
+                entry_t = entry_t.tz_localize('UTC')
+
+            # 獲取半衰期，預設 8.0 小時
+            hl = float(row.get('opening_half_life', 8.0))
+            if pd.isna(hl): hl = 8.0
+
+            # 閾值：3倍半衰期
+            time_limit_hours = hl * 3
+            deadline = entry_t + pd.Timedelta(hours=time_limit_hours)
+            remaining_time = deadline - current_utc_time
+
+            if remaining_time.total_seconds() > 0:
+                hours, rem = divmod(remaining_time.total_seconds(), 3600)
+                mins, _ = divmod(rem, 60)
+                time_left_list.append(f"{int(hours)}h {int(mins)}m")
+            else:
+                time_left_list.append("Expired ⚠️")
+        except Exception as e:
+            time_left_list.append("N/A")
 
     display_df['Live PnL_num'] = live_pnl_list
     display_df['Live PnL'] = display_df['Live PnL_num'].apply(
         lambda x: f"{x:+.2f} USDT" if pd.notna(x) else "Loading...")
+    display_df['Time Left'] = time_left_list
 
 # ==========================================
 # 📱 標題區 (頂部)
@@ -161,7 +192,6 @@ with m3:
     realized_pnl = 0.0
     if not df_trade.empty and 'pnl' in df_trade.columns:
         realized_pnl = df_trade['pnl'].sum()
-    # ✅ [新功能] 結合已實現盈虧與「實時浮動盈虧」顯示
     st.metric("Total PnL (Realized)", f"{realized_pnl:+.2f} USDT", delta=f"Float: {total_floating_pnl:+.2f} U",
               delta_color="normal")
 with m4:
@@ -190,7 +220,8 @@ with tab1:
         display_df['price2'] = display_df['price2'].apply(lambda x: f"{float(x):.4f}" if pd.notna(x) else "N/A")
         display_df['beta'] = display_df['beta'].apply(lambda x: f"{float(x):.6f}" if pd.notna(x) else "N/A")
 
-        cols = ['entry_time', 'pair', 'peak_z_score', 'Current Z', 'Live PnL', 'price1', 'price2', 'beta']
+        # ✅ 新增 Time Left 顯示
+        cols = ['entry_time', 'pair', 'Time Left', 'peak_z_score', 'Current Z', 'Live PnL', 'price1', 'price2', 'beta']
 
 
         # 色彩映射函數
@@ -214,8 +245,18 @@ with tab1:
             return ''
 
 
-        # 雙重上色：Z-Score 和 Live PnL 都有專屬顏色提示
-        styled_df = display_df[cols].style.map(color_z_score, subset=['Current Z']).map(color_pnl, subset=['Live PnL'])
+        def color_time_left(val):
+            if 'Expired' in str(val):
+                return 'color: #ff4b4b; font-weight: bold;'
+            return ''
+
+
+        # 三重上色：Z-Score, Live PnL, Time Left 都有專屬顏色提示
+        styled_df = (display_df[cols].style
+                     .map(color_z_score, subset=['Current Z'])
+                     .map(color_pnl, subset=['Live PnL'])
+                     .map(color_time_left, subset=['Time Left']))
+
         st.dataframe(styled_df, use_container_width=True, hide_index=True)
 
     else:
