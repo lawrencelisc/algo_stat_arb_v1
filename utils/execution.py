@@ -26,7 +26,7 @@ class ExecutionManager:
     - Fixed CCXT Symbol parsing issue in reconcile_positions
     """
 
-    VERSION = "v2.4.1-Stable"
+    VERSION = "v2.4.2-Stable"
 
     def __init__(self, budget_per_pair=100.0):
         self.budget_per_pair = budget_per_pair
@@ -135,6 +135,18 @@ class ExecutionManager:
         except Exception as e:
             logger.error(f"❌ Profit Guard check failed: {e}")
             return False
+
+    def get_unrealized_pnl(self, symbol):
+        """Safely fetches unrealized PnL for a given symbol with retries."""
+        try:
+            clean_sym = f"{symbol.replace('USDT', '')}/USDT:USDT"
+            pos_data = self._api_call_with_retry(self.exchange.fetch_position, clean_sym)
+            if pos_data and pos_data.get('unrealizedPnl') is not None:
+                return float(pos_data['unrealizedPnl'])
+            return 0.0
+        except Exception as e:
+            logger.error(f"❌ Failed to fetch PnL for {symbol}: {e}")
+            return 0.0
 
     def check_time_exit(self, pair, entry_time_str, half_life, unrealized_pnl):
         try:

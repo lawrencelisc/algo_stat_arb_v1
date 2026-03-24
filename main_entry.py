@@ -22,9 +22,9 @@ except ImportError as e:
     sys.exit(1)
 
 # ==========================================
-# 🛰️ Tactical Configuration Center v2.4.1-Stable
+# 🛰️ Tactical Configuration Center v2.4.2-Stable
 # ==========================================
-VERSION = "v2.4.1-Stable"
+VERSION = "v2.4.2-Stable"
 BUDGET_PER_PAIR = 100.0
 DRAWDOWN_LIMIT = 100.0
 TRADE_LOG = Path("data/trade/trade_record.csv")
@@ -72,8 +72,8 @@ def high_frequency_risk_check():
 
                         half_life = row.get('opening_half_life', 8.0)
                         try:
-                            pos_data = executor.exchange.fetch_position(f"{s1.replace('USDT', '')}/USDT:USDT")
-                            u_pnl = float(pos_data['unrealizedPnl']) if pos_data else 0.0
+                            # ✅ [SCO FIX] 使用安全且帶有 Retry 機制的封裝函數獲取 PnL
+                            u_pnl = executor.get_unrealized_pnl(s1)
 
                             if executor.check_time_exit(pair, row['entry_time'], half_life, u_pnl):
                                 executor.close_specific_pair(pair, reason="TIME_EXIT")
