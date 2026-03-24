@@ -9,8 +9,10 @@ from streamlit_autorefresh import st_autorefresh
 # ==========================================
 # 🛰️ 網頁配置與自定義 CSS
 # ==========================================
+VERSION = "v2.5.1-Stable"
+
 st.set_page_config(
-    page_title="Stat-Arb v2.6 UI",
+    page_title=f"Stat-Arb {VERSION} UI",
     page_icon="🛰️",
     layout="wide"
 )
@@ -69,7 +71,7 @@ df_log, df_trade = load_data()
 # ==========================================
 col_title, col_time = st.columns([3, 1])
 with col_title:
-    st.subheader("🛰️ Stat-Arb v2.6 Command Center")
+    st.subheader(f"🛰️ Stat-Arb {VERSION} Command Center")
 with col_time:
     st.write(f"⏱️ `Last Sync: {datetime.now().strftime('%H:%M:%S')}`")
 
@@ -215,4 +217,4 @@ with tab3:
     else:
         st.write("No historical trades yet.")
 
-st.caption("v2.6.0-Stable | Command Tower Live Feed")
+st.caption(f"{VERSION} | Command Tower Live Feed")
