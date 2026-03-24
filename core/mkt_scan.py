@@ -1,26 +1,32 @@
-import os
 import time
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 import ccxt
 from loguru import logger
+from pathlib import Path
 
 
 class MarketScanner:
+    """
+    [STAGE 1] Market Scanner Module v2.4.0-Stable
+    Responsible for dynamically identifying top liquid pairs and fetching historical OHLCV data.
+    """
+    VERSION = "v2.4.0-Stable"
+
     def __init__(self):
-        # 初始化 Bybit 交易所
+        # Initialize Bybit exchange
         self.exchange = ccxt.bybit({'enableRateLimit': True})
-        logger.info('🛰️ MarketScanner system is deployed and ready')
+        logger.info(f'🛰️ MarketScanner {self.VERSION} deployed and ready')
 
     def get_top_volume_coins(self, num_coins=24, days_back=41, timeframe='1h'):
         """
-        自動抓取流動性前 N 名幣種，並同步歷史數據。
-        num_coins: 抓取幣種數量
-        days_back: 回溯天數 (建議 41 天)
-        timeframe: 時間單位 (固定為 '1h')
+        Automatically fetch the top N coins by liquidity and sync historical data.
+        num_coins: Number of coins to fetch
+        days_back: Lookback period (41 days recommended for 1h coint test)
+        timeframe: Timeframe (fixed at '1h')
         """
         try:
-            # --- 1. 動態篩選流動性 Top N ---
+            # --- 1. Dynamic Liquidity Screening Top N ---
             logger.info(f"🔍 Scanning top {num_coins} perpetual contracts by volume on Bybit...")
             tickers = self.exchange.fetch_tickers()
 
@@ -33,28 +39,31 @@ class MarketScanner:
                     })
 
             df_liquidity = pd.DataFrame(usdt_perp_list)
+            # Sort by 24h volume and extract top symbols
             top_symbols = df_liquidity.sort_values(by='volume_24h', ascending=False).head(num_coins)['symbol'].tolist()
 
-            # --- 2. 準備目錄與時間 ---
-            current_dir = os.path.dirname(os.path.abspath(__file__)) if '__file__' in locals() else os.getcwd()
-            data_dir = os.path.join(current_dir, 'data/rawdata')
-            os.makedirs(data_dir, exist_ok=True)
+            # --- 2. Directory and Time Preparation ---
+            # Use Pathlib to ensure robust directory targeting across all modules
+            root_dir = Path(__file__).resolve().parent.parent
+            data_dir = root_dir / 'data' / 'rawdata'
+            data_dir.mkdir(parents=True, exist_ok=True)
+
             date_str = datetime.now().strftime('%y%m%d')
 
-            # 計算 start_time (毫秒格式)
+            # Calculate start_time (ms format for Bybit V5)
             start_timestamp = int((datetime.now(timezone.utc) - timedelta(days=days_back)).timestamp() * 1000)
 
-            # 🛡️ [SCO FIX] 極簡轉換：確定是 '1h' 就給 Bybit '60'
+            # Ensure interval is passed correctly to Bybit ('60' instead of '1h')
             bybit_interval = '60' if timeframe == '1h' else timeframe
 
-            # --- 3. 開始抓取 ---
+            # --- 3. Start Fetching Data ---
             for symbol in top_symbols:
                 clean_symbol = symbol.split('/')[0] + "USDT"
 
                 params = {
                     'category': 'linear',
                     'symbol': clean_symbol,
-                    'interval': bybit_interval,  # 傳入 60
+                    'interval': bybit_interval,
                     'start': start_timestamp,
                     'limit': 1000,
                 }
@@ -67,32 +76,36 @@ class MarketScanner:
                     if response and 'list' in response['result']:
                         ohlcv_list = response['result']['list']
 
+                        # Convert to DataFrame
                         df = pd.DataFrame(ohlcv_list, columns=['ts', 'o', 'h', 'l', 'c', 'v', 'turnover'])
 
+                        # Format Timestamp
                         df['ts'] = pd.to_datetime(df['ts'].astype(float), unit='ms')
                         for col in ['o', 'h', 'l', 'c', 'v']:
                             df[col] = df[col].astype(float)
 
-                        # 修正 Pandas index 操作
+                        # Fix Pandas index operations
                         df.set_index('ts', inplace=True)
                         df.sort_index(inplace=True)
 
-                        # 🛡️ [SCO FIX] 存檔拿走 m 字：BTCUSDT_1h_260321.parquet
+                        # Save to Parquet format (efficient and fast)
                         file_name = f"{clean_symbol}_{timeframe}_{date_str}.parquet"
-                        file_path = os.path.join(data_dir, file_name)
-                        df.to_parquet(file_path, engine='pyarrow')
+                        file_path = data_dir / file_name
+                        df.to_parquet(str(file_path), engine='pyarrow')
 
                         logger.success(f"💾 Saved: {file_name} (Total {len(df)} records)")
 
                     else:
                         logger.warning(f"⚠️ No data returned for {clean_symbol}")
 
-                    time.sleep(0.1)  # 避開 Rate Limit
+                    time.sleep(0.1)  # Avoid hitting Rate Limit
 
                 except Exception as e:
                     logger.error(f"❌ Failed to fetch {clean_symbol}: {e}")
 
             logger.info("✅ Task completed: Liquidity list and historical data are aligned.")
+
+            # CRITICAL: Return the list of top coins to be used by the Screener module
             return top_symbols
 
         except Exception as e:

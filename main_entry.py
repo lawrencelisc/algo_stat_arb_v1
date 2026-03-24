@@ -7,11 +7,12 @@ from loguru import logger
 from datetime import datetime
 
 # --- 路徑自愈邏輯 ---
+# 確保系統能正確識別 core/utils 目錄
 root_path = Path(__file__).resolve().parent
 if str(root_path) not in sys.path:
     sys.path.append(str(root_path))
 
-# 引入核心模組
+# 引入核心戰術模組
 try:
     from core.mkt_scan import MarketScanner
     from core.pair_screen import PairCombine
@@ -19,18 +20,18 @@ try:
     from utils.execution import ExecutionManager
     from utils.tg_wrapper import TelegramReporter
 except ImportError as e:
-    logger.error(f"❌ 模組載入失敗，請檢查目錄結構: {e}")
+    logger.error(f"❌ Failed to load modules, please check directory structure: {e}")
     sys.exit(1)
 
 # ==========================================
-# 🛰️ 戰術配置中心 v2.3-Stable
+# 🛰️ 戰術配置中心 v2.4.0-Stable
 # ==========================================
-VERSION = "v2.3.0-Stable"
-BUDGET_PER_PAIR = 100.0  # 每對組合預算
-DRAWDOWN_LIMIT = 100.0  # 利潤回撤容忍額度 (Strategy 2)
+VERSION = "v2.4.0-Stable"
+BUDGET_PER_PAIR = 100.0  # 每對組合預算 (USDT)
+DRAWDOWN_LIMIT = 100.0  # 總賬戶回撤保護 (HWM 斷路器)
 TRADE_LOG = Path("data/trade/trade_record.csv")
 
-# 初始化組件
+# 初始化自動化組件
 scanner = MarketScanner()
 screener = PairCombine()
 monitor = PairMonitor()
@@ -38,109 +39,128 @@ executor = ExecutionManager(budget_per_pair=BUDGET_PER_PAIR)
 tg = TelegramReporter()
 
 
-def hourly_zscore_check():
-    """每小時巡邏任務：監控 Z-Score 並執行風險管理優化"""
-    logger.info(f"🛰️ 定時巡邏啟動 (Main {VERSION})：正在掃描獵場與執行風險審計...")
-
+def high_frequency_risk_check():
+    """
+    [手術 3] 高頻風險巡邏 (每 10 分鐘執行)：
+    專門監控 Trailing TP、Time-Exit 與 Profit Guard，確保及時鎖定利潤，防止 PnL 大幅回吐。
+    """
+    logger.info(f"🛡️ Starting high-frequency risk check (v{VERSION})...")
     try:
-        # ---------------------------------------------------------
-        # 🛡️ [OPTIMIZATION 2] Profit Guard (利潤斷路器)
-        # ---------------------------------------------------------
+        # 1. 檢查 Profit Guard (全場總盈虧斷路器)
         bal = executor.exchange.fetch_balance()
         current_equity = float(bal['info']['result']['list'][0]['totalEquity'])
 
         if executor.check_profit_guard(current_equity, drawdown_limit=DRAWDOWN_LIMIT):
-            tg.send_error_alert("PROFIT GUARD TRIGGERED", "MainTower",
-                                f"Equity {current_equity}U dropped. Panic Close executed.")
-            return  # 若觸發全場平倉，本次巡邏結束
+            tg.send_error_alert("PROFIT GUARD TRIGGERED", "MainTower", f"Panic Exit at {current_equity}U")
+            return
 
-        # ---------------------------------------------------------
-        # ⏳ [OPTIMIZATION 1] Time-based Exit (超時平倉)
-        # ---------------------------------------------------------
+            # 2. 持倉微觀監控 (檢查個別組合是否需要撤退)
         if TRADE_LOG.exists():
-            try:
-                df_trades = pd.read_csv(TRADE_LOG)
-                open_trades = df_trades[df_trades['status'] == 'OPEN']
+            df_trades = pd.read_csv(TRADE_LOG)
+            open_trades = df_trades[df_trades['status'] == 'OPEN']
 
-                if not open_trades.empty:
-                    logger.info(f"🔎 正在檢查 {len(open_trades)} 個活動持倉的持有時間...")
-                    positions = executor.exchange.fetch_positions(params={'category': 'linear'})
+            if not open_trades.empty:
+                # 獲取最新即時價格
+                all_symbols = list(set(open_trades['s1'].tolist() + open_trades['s2'].tolist()))
+                current_prices = monitor.fetch_latest_prices(all_symbols)
 
-                    for idx, row in open_trades.iterrows():
-                        pair = row['pair']
+                for idx, row in open_trades.iterrows():
+                    pair = row['pair']
+                    s1, s2 = row['s1'], row['s2']
 
-                        # ⚠️ 防呆機制：相容舊帳本，如果沒有 opening_half_life 就預設為 8.0
+                    if s1 in current_prices and s2 in current_prices:
+                        # 即時計算 Z-Score (使用開倉時記錄的統計參數)
+                        p1, p2 = current_prices[s1], current_prices[s2]
+                        beta = float(row['beta'])
+                        alpha = float(row.get('alpha', 0))
+                        std = float(row.get('spread_std', 0.01))
+
+                        z_score = (p1 - (beta * p2 + alpha)) / std
+
+                        # A. 檢查追蹤止盈 (Trailing Take Profit)
+                        if executor.check_trailing_tp(pair, z_score):
+                            executor.close_specific_pair(pair, reason="TRAILING_TP")
+                            continue
+
+                        # B. 檢查超時平倉 (Time-based Exit)
                         half_life = row.get('opening_half_life', 8.0)
-                        if pd.isna(half_life):
-                            half_life = 8.0
+                        try:
+                            # 獲取該組合第一條腿的未實現盈虧作為平倉條件之一
+                            pos_data = executor.exchange.fetch_position(f"{s1.replace('USDT', '')}/USDT:USDT")
+                            u_pnl = float(pos_data['unrealizedPnl']) if pos_data else 0.0
 
-                        pos_info = next((p for p in positions if p['symbol'].replace(':USDT', '') == row['s1']), None)
-                        unrealized_pnl = float(pos_info['unrealizedPnl']) if pos_info else 0.0
-
-                        # 檢查是否超時
-                        if executor.check_time_exit(pair, row['entry_time'], float(half_life), unrealized_pnl):
-                            # ✅ v2.3 精準平倉：只平嗰一對，唔會誤傷其他！
-                            success = executor.close_specific_pair(pair, reason="TIME_EXIT")
-                            if success:
-                                tg.send_heartbeat(0.0, 0, f"⏳ Time-Exit executed for {pair}. Profit secured.")
-            except pd.errors.ParserError:
-                logger.error("❌ trade_record.csv 格式錯誤，可能包含新舊混雜欄位。請刪除或備份該檔案。")
-            except Exception as e:
-                logger.error(f"❌ Time Exit 執行異常: {e}")
-
-        # ---------------------------------------------------------
-        # 🎯 標規動作：Z-Score 監控與落單執行
-        # ---------------------------------------------------------
-        monitor.check_all_pairs()
-        executor.process_signals()
-        executor.reconcile_positions()
+                            if executor.check_time_exit(pair, row['entry_time'], half_life, u_pnl):
+                                executor.close_specific_pair(pair, reason="TIME_EXIT")
+                        except Exception as e:
+                            logger.error(f"⚠️ Unable to fetch position details for {pair}: {e}")
 
     except Exception as e:
-        logger.error(f"❌ 巡邏任務發生錯誤: {e}")
-        tg.send_error_alert(str(e), "hourly_zscore_check")
+        logger.error(f"❌ High-frequency risk check exception: {e}")
+
+
+def hourly_routine():
+    """每小時常規任務：監控信號、執行落單、對帳"""
+    logger.info(f"🛰️ Starting hourly routine (v{VERSION})...")
+    try:
+        # 1. 檢查所有監控中的 Pairs
+        monitor.check_all_pairs()
+        # 2. 處理 PENDING 狀態的信號
+        executor.process_signals()
+        # 3. 執行本機與交易所的自動對帳
+        executor.reconcile_positions()
+    except Exception as e:
+        logger.error(f"❌ Hourly routine execution failed: {e}")
 
 
 def week_schedule():
-    """每週大掃描：重新篩選共整合組合"""
-    logger.info("📅 每週戰略研究啟動：更新獵物清單...")
+    """每週大掃描：重新計算全市場相關性與共整合關係"""
+    logger.info(f"📅 Starting weekly strategic scan (v{VERSION})...")
     try:
-        # 1. 執行市場掃描，並獲取 top_coins 列表 (預設抓前 24 名，回溯 41 天)
-        top_coins = scanner.get_top_volume_coins(num_coins=24, days_back=41, timeframe='1h')
+        # 1. 抓取流動性前 24 名的幣種
+        top_coins = scanner.get_top_volume_coins(num_coins=24)
 
-        # 2. 確認有成功抓到幣種清單後，將清單傳遞給共整合篩選器
+        # 2. 如果成功獲得名單，交給篩選器進行運算
         if top_coins and len(top_coins) > 0:
-            logger.info(f"🔄 準備將 {len(top_coins)} 隻幣種交給 PairCombine 進行共整合運算...")
+            logger.info(f"🔄 Processing cross-cointegration calculation for {len(top_coins)} coins...")
             screener.pair_screener(coin_list=top_coins, timeframe='1h')
-            logger.success("✅ 獵物清單 (master_research_log.csv) 已更新。")
+            logger.success("✅ Weekly scan and watchlist update completed.")
         else:
-            logger.warning("⚠️ MarketScanner 未能回傳幣種清單，跳過共整合運算。")
+            logger.warning("⚠️ Failed to fetch valid coin list, skipping this screening.")
 
     except Exception as e:
-        logger.error(f"❌ 每週掃描失敗: {e}")
+        logger.error(f"❌ Weekly scan error: {e}")
 
 
 # ==========================================
-# 🚀 啟動調度引擎
+# 🚀 啟動自動化指揮流程
 # ==========================================
 if __name__ == "__main__":
-    logger.info(f"🚢 Stat-Arb {VERSION} 潛艇離港，正在啟動自動化指揮系統...")
+    logger.info(f"🚢 Stat-Arb {VERSION} departing, entering [Vigilance Cruise Mode]")
 
-    # 啟動時執行一次
+    # 啟動初始化程序
     week_schedule()
-    hourly_zscore_check()
+    hourly_routine()
+    high_frequency_risk_check()
 
+    # --- 排程設定 ---
+    # 1. 每週一凌晨 04:00 更新獵物名單
     schedule.every().monday.at("04:00").do(week_schedule)
-    schedule.every().hour.at(":01").do(hourly_zscore_check)
 
-    logger.info("✅ (BOOT) Initial sequence completed. Transitioning to Scheduled Mode.")
+    # 2. 每小時的第 01 分鐘執行交易檢查
+    schedule.every().hour.at(":01").do(hourly_routine)
+
+    # 3. 每 10 分鐘執行一次高頻風險守衛 (解決 PnL 回吐的關鍵)
+    schedule.every(10).minutes.do(high_frequency_risk_check)
+
+    logger.info(f"✅ (BOOT) Command system is running. Version: {VERSION}")
 
     while True:
         try:
             schedule.run_pending()
             time.sleep(1)
         except KeyboardInterrupt:
-            logger.warning("🛑 艦長手動中止程式。")
+            logger.warning("🛑 Captain manually aborted the command system.")
             break
         except Exception as e:
-            logger.error(f"🚨 系統心跳異常: {e}")
+            logger.error(f"🚨 System heartbeat exception: {e}")
             time.sleep(10)
