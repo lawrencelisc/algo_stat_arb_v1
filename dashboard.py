@@ -123,11 +123,16 @@ with tab1:
             display_df = display_df.merge(
                 latest_scan[['pair', 'last_z_score']],
                 on='pair',
-                how='left',
-                suffixes=('', '_current')
+                how='left'
             )
-            display_df.rename(columns={'last_z_score_current': 'Current Z'}, inplace=True)
-            display_df['Current Z'] = display_df['Current Z'].round(2)
+
+            # ✅ [Bug Fix] 修正欄位重新命名的邏輯，防止 KeyError
+            display_df.rename(columns={'last_z_score': 'Current Z', 'last_z_score_current': 'Current Z'}, inplace=True)
+
+            if 'Current Z' in display_df.columns:
+                display_df['Current Z'] = display_df['Current Z'].round(2)
+            else:
+                display_df['Current Z'] = "N/A"
         else:
             display_df['Current Z'] = "Wait Scan..."
 
@@ -148,8 +153,12 @@ with tab1:
                 return ''
 
 
-        styled_df = display_df[cols].style.map(color_z_score, subset=['Current Z'])
-        st.dataframe(styled_df, use_container_width=True, hide_index=True)
+        # 確保要上色的欄位存在才應用 Style
+        if 'Current Z' in display_df.columns:
+            styled_df = display_df[cols].style.map(color_z_score, subset=['Current Z'])
+            st.dataframe(styled_df, use_container_width=True, hide_index=True)
+        else:
+            st.dataframe(display_df[cols], use_container_width=True, hide_index=True)
 
     else:
         st.success("✨ All clear! Scanning for new opportunities...")
