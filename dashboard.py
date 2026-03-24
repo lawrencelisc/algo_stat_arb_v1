@@ -9,7 +9,7 @@ from streamlit_autorefresh import st_autorefresh
 # ==========================================
 # 🛰️ 網頁配置與自定義 CSS
 # ==========================================
-VERSION = "v2.5.3-Stable"
+VERSION = "v2.5.4-Stable"
 
 st.set_page_config(
     page_title=f"Stat-Arb {VERSION} UI",
@@ -119,20 +119,21 @@ with tab1:
             latest_ts = df_log['timestamp'].max()
             latest_scan = df_log[df_log['timestamp'] == latest_ts]
 
-            # ✅ [Bug Fix] 拋棄 Merge，使用 dictionary map() 來映射 Z-Score，絕對不會產生 KeyError
+            # 使用 dictionary map() 來映射 Z-Score
             z_map = latest_scan.set_index('pair')['last_z_score'].to_dict()
             display_df['Current Z'] = display_df['pair'].map(z_map)
-
-            # 安全地將數值四捨五入，若為空值 (NaN) 則補上 "N/A"
-            display_df['Current Z'] = display_df['Current Z'].apply(
-                lambda x: round(float(x), 2) if pd.notna(x) else "N/A"
-            )
         else:
             display_df['Current Z'] = "Wait Scan..."
 
-        # 整理顯示欄位
+        # 整理顯示欄位，並將小數點格式化為整齊的字串，解決 2.500000 冗長顯示問題
         display_df['entry_time'] = display_df['entry_time'].dt.strftime('%m-%d %H:%M')
-        display_df['peak_z_score'] = display_df['peak_z_score'].round(2)
+        display_df['peak_z_score'] = display_df['peak_z_score'].apply(
+            lambda x: f"{float(x):.2f}" if pd.notna(x) else "N/A")
+        display_df['Current Z'] = display_df['Current Z'].apply(
+            lambda x: f"{float(x):.2f}" if pd.notna(x) and not isinstance(x, str) else x)
+        display_df['price1'] = display_df['price1'].apply(lambda x: f"{float(x):.4f}" if pd.notna(x) else "N/A")
+        display_df['price2'] = display_df['price2'].apply(lambda x: f"{float(x):.4f}" if pd.notna(x) else "N/A")
+        display_df['beta'] = display_df['beta'].apply(lambda x: f"{float(x):.6f}" if pd.notna(x) else "N/A")
 
         cols = ['entry_time', 'pair', 'peak_z_score', 'Current Z', 'price1', 'price2', 'beta']
 
@@ -141,8 +142,8 @@ with tab1:
         def color_z_score(val):
             try:
                 v = float(val)
-                color = 'green' if abs(v) < 2.0 else 'red'
-                return f'color: {color}'
+                color = 'lightgreen' if abs(v) < 2.0 else 'salmon'
+                return f'color: {color}; font-weight: bold;'
             except:
                 return ''
 
