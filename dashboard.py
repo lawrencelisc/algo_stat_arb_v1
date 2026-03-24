@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import ccxt
 from pathlib import Path
 from datetime import datetime, timezone
 from streamlit_autorefresh import st_autorefresh
@@ -9,7 +10,7 @@ from streamlit_autorefresh import st_autorefresh
 # ==========================================
 # 🛰️ 網頁配置與自定義 CSS
 # ==========================================
-VERSION = "v2.5.4-Stable"
+VERSION = "v2.5.5-Stable"
 
 st.set_page_config(
     page_title=f"Stat-Arb {VERSION} UI",
@@ -50,12 +51,11 @@ TRADE_PATH = ROOT / 'data' / 'trade' / 'trade_record.csv'
 # ==========================================
 # 📥 數據載入與預處理 (Read Only)
 # ==========================================
-@st.cache_data(ttl=50)  # 快取 50 秒，避免頻繁讀檔
+@st.cache_data(ttl=50)  # 快取 50 秒，避免頻繁讀檔 CSV
 def load_data():
     df_log = pd.read_csv(LOG_PATH) if LOG_PATH.exists() else pd.DataFrame()
     df_trade = pd.read_csv(TRADE_PATH) if TRADE_PATH.exists() else pd.DataFrame()
 
-    # 時間格式轉換
     if not df_trade.empty and 'entry_time' in df_trade.columns:
         df_trade['entry_time'] = pd.to_datetime(df_trade['entry_time'])
     if not df_log.empty and 'timestamp' in df_log.columns:
@@ -64,7 +64,79 @@ def load_data():
     return df_log, df_trade
 
 
+# 📡 實時價格抓取 (Public API，無需 Key，安全免干擾)
+@st.cache_data(ttl=15)  # 每 15 秒才准許抓一次 API，防止被 Ban
+def fetch_live_prices(symbols):
+    if not symbols: return {}
+    try:
+        exchange = ccxt.bybit({'options': {'defaultType': 'linear'}})
+        # 轉換成 CCXT 的 Bybit 永續合約格式 (例: BTCUSDT -> BTC/USDT:USDT)
+        ccxt_symbols = [f"{s.replace('USDT', '')}/USDT:USDT" for s in symbols]
+        tickers = exchange.fetch_tickers(ccxt_symbols)
+        prices = {}
+        for s in symbols:
+            ccxt_s = f"{s.replace('USDT', '')}/USDT:USDT"
+            if ccxt_s in tickers:
+                prices[s] = float(tickers[ccxt_s]['last'])
+        return prices
+    except Exception as e:
+        return {}
+
+
 df_log, df_trade = load_data()
+
+active_df = pd.DataFrame()
+if not df_trade.empty:
+    active_df = df_trade[df_trade['status'] == 'OPEN']
+
+# 取得最新 Z-Score 用於計算方向與映射
+z_map = {}
+if not df_log.empty:
+    latest_ts = df_log['timestamp'].max()
+    latest_scan = df_log[df_log['timestamp'] == latest_ts]
+    z_map = latest_scan.set_index('pair')['last_z_score'].to_dict()
+
+# 💰 實時未實現盈虧 (Live PnL) 結算邏輯
+total_floating_pnl = 0.0
+display_df = active_df.copy() if not active_df.empty else pd.DataFrame()
+
+if not display_df.empty:
+    display_df['Current Z'] = display_df['pair'].map(z_map)
+    unique_symbols = list(set(display_df['s1'].tolist() + display_df['s2'].tolist()))
+    live_prices = fetch_live_prices(unique_symbols)
+
+    live_pnl_list = []
+    for idx, row in display_df.iterrows():
+        try:
+            z_val = row['Current Z']
+            if pd.isna(z_val):
+                live_pnl_list.append(None)
+                continue
+            z_val = float(z_val)
+
+            cp1 = live_prices.get(row['s1'])
+            cp2 = live_prices.get(row['s2'])
+
+            if cp1 is not None and cp2 is not None:
+                ep1, ep2 = float(row['price1']), float(row['price2'])
+                q1, q2 = float(row['qty1']), float(row['qty2'])
+
+                # 透過 Z-Score 正負號判斷多空方向 (Z>0: Short s1/Long s2, Z<0: Long s1/Short s2)
+                if z_val > 0:
+                    pnl = (ep1 - cp1) * q1 + (cp2 - ep2) * q2
+                else:
+                    pnl = (cp1 - ep1) * q1 + (ep2 - cp2) * q2
+
+                live_pnl_list.append(pnl)
+                total_floating_pnl += pnl
+            else:
+                live_pnl_list.append(None)
+        except Exception:
+            live_pnl_list.append(None)
+
+    display_df['Live PnL_num'] = live_pnl_list
+    display_df['Live PnL'] = display_df['Live PnL_num'].apply(
+        lambda x: f"{x:+.2f} USDT" if pd.notna(x) else "Loading...")
 
 # ==========================================
 # 📱 標題區 (頂部)
@@ -80,27 +152,23 @@ with col_time:
 # ==========================================
 m1, m2, m3, m4 = st.columns(4)
 
-active_df = pd.DataFrame()
-if not df_trade.empty:
-    active_df = df_trade[df_trade['status'] == 'OPEN']
-
 with m1:
-    st.metric("Active Pairs", f"{len(active_df)} Pairs")
+    st.metric("Active Pairs", f"{len(display_df)} Pairs")
 with m2:
     total_scanned = len(df_log) if not df_log.empty else 0
     st.metric("Total Scanned", f"{total_scanned}")
 with m3:
-    pnl = 0.0
+    realized_pnl = 0.0
     if not df_trade.empty and 'pnl' in df_trade.columns:
-        pnl = df_trade['pnl'].sum()
-    st.metric("Total PnL", f"{pnl:+.2f} USDT")
+        realized_pnl = df_trade['pnl'].sum()
+    # ✅ [新功能] 結合已實現盈虧與「實時浮動盈虧」顯示
+    st.metric("Total PnL (Realized)", f"{realized_pnl:+.2f} USDT", delta=f"Float: {total_floating_pnl:+.2f} U",
+              delta_color="normal")
 with m4:
-    # 計算健康度 (Avg P-Value of Top 10)
     avg_p = 1.0
     if not df_log.empty:
         latest_ts = df_log['timestamp'].max()
         avg_p = df_log[df_log['timestamp'] == latest_ts]['p_value'].head(10).mean()
-
     health_status = "Excellent" if avg_p < 0.01 else "Good" if avg_p < 0.05 else "Warning"
     st.metric("Strategy Health", health_status, delta=f"P-Val: {avg_p:.4f}", delta_color="inverse")
 
@@ -111,34 +179,21 @@ tab1, tab2, tab3 = st.tabs(["🔥 Active Positions", "🎯 Real-time Radar", "�
 
 # --- Tab 1: 活躍持倉 (強化版) ---
 with tab1:
-    if not active_df.empty:
-        display_df = active_df.copy()
-
-        # 取得最新 Z-Score
-        if not df_log.empty:
-            latest_ts = df_log['timestamp'].max()
-            latest_scan = df_log[df_log['timestamp'] == latest_ts]
-
-            # 使用 dictionary map() 來映射 Z-Score
-            z_map = latest_scan.set_index('pair')['last_z_score'].to_dict()
-            display_df['Current Z'] = display_df['pair'].map(z_map)
-        else:
-            display_df['Current Z'] = "Wait Scan..."
-
-        # 整理顯示欄位，並將小數點格式化為整齊的字串，解決 2.500000 冗長顯示問題
+    if not display_df.empty:
+        # 整理顯示欄位格式
         display_df['entry_time'] = display_df['entry_time'].dt.strftime('%m-%d %H:%M')
         display_df['peak_z_score'] = display_df['peak_z_score'].apply(
             lambda x: f"{float(x):.2f}" if pd.notna(x) else "N/A")
         display_df['Current Z'] = display_df['Current Z'].apply(
-            lambda x: f"{float(x):.2f}" if pd.notna(x) and not isinstance(x, str) else x)
+            lambda x: f"{float(x):.2f}" if pd.notna(x) else "Wait Scan...")
         display_df['price1'] = display_df['price1'].apply(lambda x: f"{float(x):.4f}" if pd.notna(x) else "N/A")
         display_df['price2'] = display_df['price2'].apply(lambda x: f"{float(x):.4f}" if pd.notna(x) else "N/A")
         display_df['beta'] = display_df['beta'].apply(lambda x: f"{float(x):.6f}" if pd.notna(x) else "N/A")
 
-        cols = ['entry_time', 'pair', 'peak_z_score', 'Current Z', 'price1', 'price2', 'beta']
+        cols = ['entry_time', 'pair', 'peak_z_score', 'Current Z', 'Live PnL', 'price1', 'price2', 'beta']
 
 
-        # 使用 Styler 替 Z-Score 上色 (綠色代表賺錢回歸中)
+        # 色彩映射函數
         def color_z_score(val):
             try:
                 v = float(val)
@@ -148,7 +203,19 @@ with tab1:
                 return ''
 
 
-        styled_df = display_df[cols].style.map(color_z_score, subset=['Current Z'])
+        def color_pnl(val):
+            if isinstance(val, str) and 'USDT' in val:
+                try:
+                    num = float(val.replace(' USDT', '').replace('+', ''))
+                    color = 'lightgreen' if num > 0 else 'salmon' if num < 0 else 'white'
+                    return f'color: {color}; font-weight: bold;'
+                except:
+                    return ''
+            return ''
+
+
+        # 雙重上色：Z-Score 和 Live PnL 都有專屬顏色提示
+        styled_df = display_df[cols].style.map(color_z_score, subset=['Current Z']).map(color_pnl, subset=['Live PnL'])
         st.dataframe(styled_df, use_container_width=True, hide_index=True)
 
     else:
