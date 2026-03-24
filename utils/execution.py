@@ -22,11 +22,11 @@ except ImportError as e:
 
 class ExecutionManager:
     """
-    Industrial Grade Execution Engine v2.4.1-Stable
-    - Fixed CCXT Symbol parsing issue in reconcile_positions
+    Industrial Grade Execution Engine v2.4.3-Stable
+    - ULTIMATE FIX: Bypass CCXT symbol parsing, use raw Bybit API 'info.symbol' for 100% perfect reconciliation match.
     """
 
-    VERSION = "v2.4.2-Stable"
+    VERSION = "v2.4.3-Stable"
 
     def __init__(self, budget_per_pair=100.0):
         self.budget_per_pair = budget_per_pair
@@ -213,9 +213,13 @@ class ExecutionManager:
             positions = self._api_call_with_retry(self.exchange.fetch_positions, params={'category': 'linear'})
             if positions is None: return
 
-            # ✅ [SCO FIX] Added .replace('/', '') to perfectly match CSV format (e.g. XRPUSDT)
-            real_active_symbols = {p['symbol'].replace('/', '').replace(':USDT', '') for p in positions if
-                                   float(p['contracts']) > 0}
+            # ✅ [SCO ULTIMATE FIX v2.4.3] 繞過 CCXT 解析，直接讀取 Bybit 原始的 'info' -> 'symbol'
+            # 這樣取得的字串會 100% 是 'BTCUSDT'，完美對應 CSV 內的格式
+            real_active_symbols = set()
+            for p in positions:
+                if float(p.get('contracts', 0)) > 0:
+                    raw_symbol = p['info']['symbol']
+                    real_active_symbols.add(raw_symbol)
 
             df_trade = pd.read_csv(self.trade_log)
             open_indices = df_trade[df_trade['status'] == 'OPEN'].index
