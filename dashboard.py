@@ -1,184 +1,143 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 from pathlib import Path
 from datetime import datetime
-import ccxt
+from streamlit_autorefresh import st_autorefresh
 
 # ==========================================
-# 🛰️ 儀表板配置中心
+# 🛰️ 網頁配置與縮小版面 CSS
 # ==========================================
 st.set_page_config(
-    page_title="Stat-Arb v2.1 Command Center",
+    page_title="Stat-Arb v2.5 UI",
     page_icon="🛰️",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
-# 自定義 CSS 提升質感
+# 自定義 CSS：進一步壓縮頂部空間，讓內容更緊湊
 st.markdown("""
     <style>
-    .main { background-color: #0e1117; }
-    .stMetric { background-color: #1e2130; padding: 15px; border-radius: 10px; border-left: 5px solid #00ff00; }
-    div[data-testid="stMetricValue"] { color: #00ff00; }
+    /* 移除 Streamlit 預設的頂部大空白 */
+    .block-container {
+        padding-top: 1rem !important;
+        padding-bottom: 0rem !important;
+        padding-left: 2rem !important;
+        padding-right: 2rem !important;
+    }
+    /* 縮小 Metric 卡片的大小 */
+    [data-testid="stMetricValue"] {
+        font-size: 1.8rem !important;
+    }
+    .stMetric {
+        background-color: #1e2130;
+        padding: 15px;
+        border-radius: 10px;
+        border: 1px solid #3e4259;
+    }
+    /* 移除底部多餘空白 */
+    footer {visibility: hidden;}
     </style>
-""", unsafe_allow_html=True)
+    """, unsafe_allow_html=True)  # ✅ [FIX] 修正參數名稱為 unsafe_allow_html
 
-# 讀取路徑
+# 🚀 [核心功能] 自動更新設定
+# interval=60 * 1000 代表每 60,000 毫秒 (1分鐘) 自動重新整理一次
+st_autorefresh(interval=60 * 1000, key="datarefresh")
+
+# --- 項目路徑 ---
 ROOT = Path(__file__).resolve().parent
 LOG_PATH = ROOT / 'result' / 'master_research_log.csv'
 TRADE_PATH = ROOT / 'data' / 'trade' / 'trade_record.csv'
-SIGNAL_PATH = ROOT / 'data' / 'signal' / 'signal_table.csv'
 
 
 # ==========================================
-# 📥 數據載入引擎 (含緩存邏輯)
+# 📥 數據載入 (Read Only)
 # ==========================================
 def load_data():
+    """Reads CSV files and handles missing files gracefully"""
     df_log = pd.read_csv(LOG_PATH) if LOG_PATH.exists() else pd.DataFrame()
     df_trade = pd.read_csv(TRADE_PATH) if TRADE_PATH.exists() else pd.DataFrame()
-    df_sig = pd.read_csv(SIGNAL_PATH) if SIGNAL_PATH.exists() else pd.DataFrame()
-    return df_log, df_trade, df_sig
+    return df_log, df_trade
 
-
-df_log, df_trade, df_sig = load_data()
 
 # ==========================================
-# 📱 Sidebar: 實時系統狀態
+# 📱 標題區 (頂部)
 # ==========================================
-st.sidebar.title("🛰️ 指揮塔監控")
-st.sidebar.markdown("---")
-status = "🟢 運作中" if not df_log.empty else "🔴 停止"
-st.sidebar.write(f"系統狀態: **{status}**")
-st.sidebar.write(f"帳戶本金: **1,942.43 USDT**")
-st.sidebar.write(f"最後更新: `{datetime.now().strftime('%H:%M:%S')}`")
+col_title, col_time = st.columns([3, 1])
+with col_title:
+    st.subheader("🛰️ Stat-Arb v2.5 Command Center")
+with col_time:
+    # 顯示目前 UI 的重新整理時間
+    st.write(f"⏱️ `Last Sync: {datetime.now().strftime('%H:%M:%S')}`")
 
-if st.sidebar.button("🔄 手動刷新數據"):
-    st.rerun()
+df_log, df_trade = load_data()
 
 # ==========================================
-# 📊 第一區塊：核心指標 (Top Metrics)
+# 📊 第一層：數據指標 (Metrics)
 # ==========================================
-col1, col2, col3, col4 = st.columns(4)
+m1, m2, m3, m4 = st.columns(4)
 
-active_pairs = len(df_trade[df_trade['status'] == 'OPEN']) if not df_trade.empty else 0
-total_pnl = df_trade['pnl'].sum() if 'pnl' in df_trade.columns else 0.0
+active_df = pd.DataFrame()
+if not df_trade.empty:
+    active_df = df_trade[df_trade['status'] == 'OPEN']
 
-with col1:
-    st.metric("當前持倉 (Pairs)", f"{active_pairs} / 10")
-with col2:
-    st.metric("累計利潤 (USDT)", f"{total_pnl:+.2f}")
-with col3:
-    win_rate = 0.0
-    if 'pnl' in df_trade.columns and len(df_trade) > 0:
-        win_rate = len(df_trade[df_trade['pnl'] > 0]) / len(df_trade)
-    st.metric("勝率 (Win Rate)", f"{win_rate:.1%}")
-with col4:
-    z_extreme = 0
+with m1:
+    st.metric("Active Pairs", f"{len(active_df)} Pairs")
+with m2:
+    total_scanned = len(df_log) if not df_log.empty else 0
+    st.metric("Total Scanned", f"{total_scanned}")
+with m3:
+    pnl = 0.0
+    if not df_trade.empty and 'pnl' in df_trade.columns:
+        pnl = df_trade['pnl'].sum()
+    st.metric("Total PnL", f"{pnl:+.2f} USDT")
+with m4:
+    health = "Good"
     if not df_log.empty:
-        last_ts = df_log['timestamp'].max()
-        z_extreme = len(df_log[(df_log['timestamp'] == last_ts) & (abs(df_log['last_z_score']) > 2.0)])
-    st.metric("極端偏離機會", f"{z_extreme}")
+        avg_p = df_log['p_value'].head(10).mean()
+        health = "Excellent" if avg_p < 0.01 else "Normal"
+    st.metric("Strategy Health", health)
 
 # ==========================================
-# 📈 第二區塊：Performance Chart (Equity Curve)
+# 📑 第二層：分頁視圖 (Tabs)
 # ==========================================
-st.markdown("---")
-st.header("📈 績效表現與回撤 (Equity Curve)")
+tab1, tab2, tab3 = st.tabs(["🎯 Real-time Radar", "🔥 Active Positions", "📜 Historical Logs"])
 
-if not df_trade.empty and 'pnl' in df_trade.columns:
-    df_trade['entry_time'] = pd.to_datetime(df_trade['entry_time'])
-    df_trade = df_trade.sort_values('entry_time')
-    df_trade['cum_pnl'] = df_trade['pnl'].cumsum() + 1945.70
-
-    fig_equity = px.line(df_trade, x='entry_time', y='cum_pnl',
-                         title='帳戶總權益增長曲線',
-                         color_discrete_sequence=['#00ff00'])
-    fig_equity.update_layout(xaxis_title="時間", yaxis_title="USDT", template="plotly_dark")
-    st.plotly_chart(fig_equity, use_container_width=True)
-else:
-    st.info("💡 目前尚無已平倉數據，待首筆交易結算後將顯示累計收益曲線。")
-
-# ==========================================
-# 🎯 第三區塊：Z-Score Profile & Radar
-# ==========================================
-st.markdown("---")
-left_col, right_col = st.columns([2, 1])
-
-with left_col:
-    st.header("🎯 獵場即時掃描 (Z-Score Radar)")
+with tab1:
     if not df_log.empty:
-        last_ts = df_log['timestamp'].max()
-        df_latest = df_log[df_log['timestamp'] == last_ts].copy()
+        latest_ts = df_log['timestamp'].max()
+        df_plot = df_log[df_log['timestamp'] == latest_ts].copy()
+        df_plot['abs_z'] = df_plot['last_z_score'].abs()
+        df_plot = df_plot.sort_values(by='abs_z', ascending=False).head(15)
 
-        # 只取偏離最嚴重的 Top 15
-        df_top = df_latest.sort_values(by='last_z_score', key=abs, ascending=False).head(15)
+        fig = px.bar(
+            df_plot, x='pair', y='last_z_score',
+            color='last_z_score',
+            color_continuous_scale='RdYlGn_r',
+            range_y=[-4, 4],
+            height=350  # 再次縮小圖表高度以節省空間
+        )
+        fig.add_hline(y=2.0, line_dash="dash", line_color="#ff4b4b")
+        fig.add_hline(y=-2.0, line_dash="dash", line_color="#00ff00")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No scan data available.")
 
-        fig_z = px.bar(df_top, x='pair', y='last_z_score',
-                       color='last_z_score',
-                       color_continuous_scale='RdYlGn_r',  # 紅綠反轉
-                       title="Top 15 偏離組合 (Z > 2.0 為進場訊號)")
-        fig_z.add_hline(y=2.0, line_dash="dash", line_color="red", annotation_text="SELL Spread")
-        fig_z.add_hline(y=-2.0, line_dash="dash", line_color="green", annotation_text="BUY Spread")
-        fig_z.update_layout(template="plotly_dark")
-        st.plotly_chart(fig_z, use_container_width=True)
+with tab2:
+    if not active_df.empty:
+        display_df = active_df.copy()
+        if 'entry_time' in display_df.columns:
+            display_df['entry_time'] = pd.to_datetime(display_df['entry_time']).dt.strftime('%m-%d %H:%M')
 
-with right_col:
-    st.header("🔍 統計分布")
-    if not df_log.empty:
-        fig_hist = px.histogram(df_latest, x="last_z_score", nbins=30,
-                                title="全市場 190 對 Z-Score 分布",
-                                color_discrete_sequence=['#636EFA'])
-        fig_hist.update_layout(template="plotly_dark")
-        st.plotly_chart(fig_hist, use_container_width=True)
+        # 精簡欄位，讓表格橫向空間更小
+        cols = ['entry_time', 'pair', 'price1', 'price2', 'beta', 'peak_z_score']
+        st.dataframe(display_df[cols], use_container_width=True)
+    else:
+        st.success("Scanning for new opportunities...")
 
-# ==========================================
-# 📂 第四區塊：交易與持倉 (Transactions)
-# ==========================================
-st.markdown("---")
-st.header("📂 實時持倉與歷史清單")
-
-tabs = st.tabs(["🔥 當前持倉 (Active)", "📜 歷史紀錄 (History)", "⚓ 被攔截訊號 (Skipped)"])
-
-with tabs[0]:
+with tab3:
     if not df_trade.empty:
-        active_df = df_trade[df_trade['status'] == 'OPEN'].copy()
-        if not active_df.empty:
-            st.dataframe(active_df.style.background_gradient(subset=['beta'], cmap='Blues'), use_container_width=True)
-        else:
-            st.write("目前無持倉中部位。")
+        # 顯示最近 20 筆歷史紀錄
+        history_df = df_trade[df_trade['status'] != 'OPEN'].tail(20)
+        st.dataframe(history_df, use_container_width=True)
 
-with tabs[1]:
-    if not df_trade.empty:
-        st.dataframe(df_trade.sort_values('entry_time', ascending=False), use_container_width=True)
-
-with tabs[2]:
-    if not df_sig.empty:
-        skipped = df_sig[df_sig['status'].str.contains('SKIP', na=False)]
-        st.dataframe(skipped.sort_values('timestamp', ascending=False), use_container_width=True)
-
-# ==========================================
-# 🧪 第五區塊：科學官深度分析 (Advanced Insights)
-# ==========================================
-st.markdown("---")
-st.header("🧪 首席科學官：深度監控 (Advanced Analytics)")
-
-col_a, col_b = st.columns(2)
-
-with col_a:
-    st.subheader("📡 均值回歸速度 (Half-Life)")
-    if not df_log.empty:
-        df_hl = df_latest[df_latest['p_value'] < 0.05].sort_values('half_life').head(10)
-        fig_hl = px.scatter(df_hl, x="pair", y="half_life", size="correlation", color="p_value",
-                            title="Top 10 最快回歸組合 (氣泡越大代表相關性越高)")
-        fig_hl.update_layout(template="plotly_dark")
-        st.plotly_chart(fig_hl, use_container_width=True)
-
-with col_b:
-    st.subheader("⚓ 資金費率地圖 (Funding Guard Preview)")
-    st.info("此模組將在下個版本中顯示全市場幣種的資金費率熱圖，幫助預測開倉障礙。")
-
-# 腳註
-st.markdown("---")
-st.caption(f"🛰️ Stat-Arb v2.1 Dashboard | 數據路徑: {ROOT} | 切記：統計利潤需要時間耐心等待回歸。")
+st.caption("v2.5.0-Stable | Command Tower Live Feed")

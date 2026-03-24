@@ -9,3 +9,4 @@ statsmodels
 streamlit
 plotly
 pathlib
+streamlit-autorefresh

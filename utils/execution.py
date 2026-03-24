@@ -22,19 +22,13 @@ except ImportError as e:
 
 class ExecutionManager:
     """
-    Industrial Grade Execution Engine v2.4.0-Stable (Trailing TP Optimized)
-    Functional Features:
-        1. Time-based Exit (3x Half-life)
-        2. Profit Guard (HWM Kill Switch)
-        3. Trailing Take Profit (Z-Score Based)
-        4. Triple-Step Defense (VWAP, Drift, IOC)
-        5. Automatic Reconciliation & Position Audit
+    Industrial Grade Execution Engine v2.4.1-Stable
+    - Fixed CCXT Symbol parsing issue in reconcile_positions
     """
 
-    VERSION = "v2.4.0-Stable"
+    VERSION = "v2.4.1-Stable"
 
     def __init__(self, budget_per_pair=100.0):
-        # 1. Resource & Path Definitions
         self.budget_per_pair = budget_per_pair
         self.root_dir = Path(__file__).resolve().parent.parent
         self.signal_file = self.root_dir / 'data' / 'signal' / 'signal_table.csv'
@@ -42,28 +36,23 @@ class ExecutionManager:
         self.vault_dir = self.root_dir / 'data' / 'vault'
         self.hwm_file = self.vault_dir / 'equity_hwm.json'
 
-        # Ensure directories exist
         self.trade_log.parent.mkdir(parents=True, exist_ok=True)
         self.signal_file.parent.mkdir(parents=True, exist_ok=True)
         self.vault_dir.mkdir(parents=True, exist_ok=True)
 
-        # 2. Safety & Risk Parameters
-        self.DRIFT_THRESHOLD = 0.003  # 0.3% price drift limit
-        self.SLIPPAGE_TOLERANCE = 0.001  # 0.1% IOC slippage tolerance
-        self.MAX_RETRIES = 5  # Exponential backoff retries
-        self.MAX_FUNDING_DAILY = 0.0003  # 0.03% daily funding cost limit
+        self.DRIFT_THRESHOLD = 0.003
+        self.SLIPPAGE_TOLERANCE = 0.001
+        self.MAX_RETRIES = 5
+        self.MAX_FUNDING_DAILY = 0.0003
 
-        # 3. [NEW] Trailing Take Profit Parameters
-        self.TRAILING_TP_START = 0.8  # Activate trailing when |Z| < 0.8
-        self.TRAILING_CALLBACK = 0.5  # Trigger exit if Z bounces back by 0.5 units
+        self.TRAILING_TP_START = 0.8
+        self.TRAILING_CALLBACK = 0.5
 
         self.tg = TelegramReporter()
-
         logger.info(f"🚀 Initializing ExecutionManager {self.VERSION}")
         self._init_exchange()
 
     def _init_exchange(self):
-        """Initializes the exchange connection via DataBridge"""
         try:
             db = DataBridge()
             config = db.load_bybit_api_config()
@@ -80,7 +69,6 @@ class ExecutionManager:
             self.exchange = None
 
     def _api_call_with_retry(self, func, *args, **kwargs):
-        """Wrapper for API calls with exponential backoff retry logic"""
         for i in range(self.MAX_RETRIES):
             try:
                 return func(*args, **kwargs)
@@ -90,14 +78,7 @@ class ExecutionManager:
                 time.sleep(wait_time)
         return None
 
-    # ==========================================
-    # 🏹 [Surgery 3] Trailing Take Profit
-    # ==========================================
     def check_trailing_tp(self, pair, current_z):
-        """
-        Dynamic Trailing Take Profit based on Z-Score.
-        Prevents profit giveback (e.g., PnL drop from 1510 to 1380).
-        """
         try:
             if not self.trade_log.exists(): return False
             df = pd.read_csv(self.trade_log)
@@ -105,21 +86,17 @@ class ExecutionManager:
 
             if not idx_list.empty:
                 idx = idx_list[0]
-
-                # Retrieve the best recorded Z-score (peak_z_score)
                 peak_z = df.at[idx, 'peak_z_score'] if 'peak_z_score' in df.columns else 2.5
                 if pd.isna(peak_z): peak_z = 2.5
 
                 curr_abs_z = abs(current_z)
                 peak_abs_z = abs(peak_z)
 
-                # 1. Update Peak Z-score (the closer to 0, the better)
                 if curr_abs_z < peak_abs_z:
                     df.at[idx, 'peak_z_score'] = current_z
                     df.to_csv(self.trade_log, index=False)
                     return False
 
-                # 2. Check for callback/rebound
                 if peak_abs_z < self.TRAILING_TP_START:
                     rebound = curr_abs_z - peak_abs_z
                     if rebound >= self.TRAILING_CALLBACK:
@@ -131,33 +108,23 @@ class ExecutionManager:
             logger.error(f"❌ Trailing TP check failed: {e}")
             return False
 
-    # ==========================================
-    # 🛡️ [Surgery 4] Profit Guard (HWM Kill Switch)
-    # ==========================================
     def check_profit_guard(self, current_equity, drawdown_limit=100.0):
-        """
-        Kill Switch based on High-Water Mark (HWM) drawdown.
-        Protects existing gains from severe market decoupling.
-        """
         try:
             max_equity = current_equity
-
             if self.hwm_file.exists():
                 try:
                     with open(self.hwm_file, 'r') as f:
                         data = json.load(f)
                         max_equity = data.get("max_equity", current_equity)
                 except json.JSONDecodeError:
-                    logger.warning("⚠️ Vault JSON corrupted. Rebuilding...")
+                    pass
 
-            # Update Peak if we reach new heights
             if current_equity > max_equity:
                 max_equity = current_equity
                 with open(self.hwm_file, 'w') as f:
                     json.dump({"max_equity": max_equity, "timestamp": str(datetime.now(timezone.utc))}, f)
                 return False
 
-            # Trigger Kill Switch if drawdown from peak exceeds limit
             drawdown = max_equity - current_equity
             if drawdown >= drawdown_limit:
                 logger.critical(f"🚨 [PROFIT GUARD] Drawdown {drawdown:.2f}U detected from peak {max_equity:.2f}U!")
@@ -169,14 +136,7 @@ class ExecutionManager:
             logger.error(f"❌ Profit Guard check failed: {e}")
             return False
 
-    # ==========================================
-    # ⏳ [Surgery 1] Time-based Exit
-    # ==========================================
     def check_time_exit(self, pair, entry_time_str, half_life, unrealized_pnl):
-        """
-        Exit if position duration exceeds 3x Half-life and is in profit.
-        Improves capital turnover by closing 'stale' positions.
-        """
         try:
             hl_value = float(half_life) if pd.notna(half_life) and float(half_life) > 0 else 8.0
             entry_time = datetime.strptime(entry_time_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
@@ -194,11 +154,7 @@ class ExecutionManager:
             logger.error(f"❌ Time-exit check failed for {pair}: {e}")
             return False
 
-    # ==========================================
-    # 🎯 Targeted Specific Pair Close
-    # ==========================================
     def close_specific_pair(self, pair_name, reason="EXIT"):
-        """Safely closes a single pair instead of emergency closing everything."""
         logger.info(f"✂️ Initiating targeted close for {pair_name} (Reason: {reason})")
         try:
             if not self.trade_log.exists(): return False
@@ -245,7 +201,10 @@ class ExecutionManager:
             positions = self._api_call_with_retry(self.exchange.fetch_positions, params={'category': 'linear'})
             if positions is None: return
 
-            real_active_symbols = {p['symbol'].replace(':USDT', '') for p in positions if float(p['contracts']) > 0}
+            # ✅ [SCO FIX] Added .replace('/', '') to perfectly match CSV format (e.g. XRPUSDT)
+            real_active_symbols = {p['symbol'].replace('/', '').replace(':USDT', '') for p in positions if
+                                   float(p['contracts']) > 0}
+
             df_trade = pd.read_csv(self.trade_log)
             open_indices = df_trade[df_trade['status'] == 'OPEN'].index
 
@@ -259,8 +218,7 @@ class ExecutionManager:
 
                 if not has_s1 and not has_s2:
                     df_trade.at[idx, 'status'] = 'CLOSED_SYNC'
-                    self.tg.send_error_alert(f"External Closure: {pair}", "ReconModule",
-                                             "Synced to CLOSED-SYNC")  # 避免 TG Bug
+                    self.tg.send_error_alert(f"External Closure: {pair}", "ReconModule", "Synced to CLOSED-SYNC")
                     reconciled_count += 1
                 elif not has_s1 or not has_s2:
                     missing = s1 if not has_s1 else s2
@@ -275,7 +233,6 @@ class ExecutionManager:
             logger.error(f"❌ [RECON] Audit failed: {e}")
 
     def _is_funding_rate_acceptable(self, s1, s2, side1, side2):
-        """Checks if the predicted 8h funding cost exceeds the safety threshold"""
         try:
             sym1 = f"{s1.replace('USDT', '')}/USDT:USDT"
             sym2 = f"{s2.replace('USDT', '')}/USDT:USDT"
@@ -296,7 +253,6 @@ class ExecutionManager:
             return True, 0.0
 
     def process_signals(self):
-        """Orchestrates signal processing and order execution"""
         if not self.signal_file.exists() or self.exchange is None:
             return
 
@@ -306,7 +262,6 @@ class ExecutionManager:
             if pending_orders.empty: return
 
             for idx, order in pending_orders.iterrows():
-                # Check Funding Cost
                 is_cost_ok, cost = self._is_funding_rate_acceptable(order['s1'], order['s2'], order['side1'],
                                                                     order['side2'])
                 if not is_cost_ok:
@@ -315,12 +270,10 @@ class ExecutionManager:
                     logger.warning(f"🚫 [FUNDING GUARD] Intercepted {order['pair']} due to high cost: {cost:.4%}")
                     continue
 
-                # Check Symbol Conflicts
                 if self._is_symbol_conflicted(order['s1'], order['s2']):
                     df.at[idx, 'status'] = 'SKIPPED_COLLISION'
                     continue
 
-                # Execute Open
                 self._execute_safe_open(idx, order, df)
 
             df.to_csv(self.signal_file, index=False)
@@ -328,7 +281,6 @@ class ExecutionManager:
             logger.error(f"❌ Signal orchestrator error: {e}")
 
     def _execute_safe_open(self, idx, order, df):
-        """Executes the open trade using Triple-Step Defense logic"""
         p1, p2, is_ready = self._check_drift_and_get_prices(order)
         if not is_ready:
             df.at[idx, 'status'] = 'SKIPPED_STALE'
@@ -344,8 +296,6 @@ class ExecutionManager:
         success = self._fire_dual_ioc_orders(order, q1, q2, p1, p2)
         if success:
             df.at[idx, 'status'] = 'EXECUTED'
-
-            # Record with new v2.4 fields
             h_life = order.get('half_life', 8.0)
             self._record_trade_log(order, q1, q2, p1, p2, h_life)
 
@@ -359,7 +309,6 @@ class ExecutionManager:
         return False
 
     def _get_orderbook_vwap(self, symbol, side, depth=3):
-        """Calculates VWAP from top 3 layers of orderbook for precise execution"""
         try:
             clean_sym = f"{symbol.replace('USDT', '')}/USDT:USDT"
             ob = self._api_call_with_retry(self.exchange.fetch_order_book, clean_sym, limit=5)
@@ -375,13 +324,11 @@ class ExecutionManager:
             return None
 
     def _check_drift_and_get_prices(self, order):
-        """Double-checks price drift to prevent chasing 'stale' signals"""
         p1 = self._get_orderbook_vwap(order['s1'], order['side1'])
         p2 = self._get_orderbook_vwap(order['s2'], order['side2'])
         return p1, p2, (p1 is not None and p2 is not None)
 
     def _fire_dual_ioc_orders(self, order, q1, q2, p1, p2):
-        """Fires both legs of the pair trade simultaneously using Limit IOC orders"""
         s1_side, s2_side = order['side1'].lower(), order['side2'].lower()
 
         lp1 = p1 * (1 + self.SLIPPAGE_TOLERANCE) if s1_side == 'buy' else p1 * (1 - self.SLIPPAGE_TOLERANCE)
@@ -410,7 +357,6 @@ class ExecutionManager:
         return False
 
     def _calculate_aligned_quantities(self, s1, s2, p1, p2, beta):
-        """Calculates and aligns quantities with exchange precision requirements"""
         try:
             qty1 = self.budget_per_pair / p1
             qty2 = qty1 * abs(float(beta))
@@ -427,33 +373,29 @@ class ExecutionManager:
             return None, None
 
     def _is_symbol_conflicted(self, s1, s2):
-        """Prevents symbol collision (One-Asset-One-Pair rule)"""
         if not self.trade_log.exists(): return False
         df = pd.read_csv(self.trade_log)
         active_assets = set(df[df['status'] == 'OPEN'][['s1', 's2']].values.flatten())
         return s1 in active_assets or s2 in active_assets
 
     def _has_sufficient_balance(self):
-        """Pre-flight check for available USDT balance"""
         bal = self._api_call_with_retry(self.exchange.fetch_balance)
         if not bal: return False
         return float(bal['info']['result']['list'][0]['totalAvailableBalance']) >= self.budget_per_pair
 
     def _record_trade_log(self, order, q1, q2, p1, p2, half_life):
-        """Persists trade details including peak_z_score for strategy management"""
         log = {
             'entry_time': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
             'pair': order['pair'], 's1': order['s1'], 's2': order['s2'],
             'qty1': q1, 'qty2': q2, 'price1': p1, 'price2': p2,
             'beta': order['beta'],
             'opening_half_life': half_life,
-            'peak_z_score': 2.5,  # Initialize peak Z-score for Trailing TP
+            'peak_z_score': 2.5,
             'status': 'OPEN'
         }
         pd.DataFrame([log]).to_csv(self.trade_log, mode='a', index=False, header=not self.trade_log.exists())
 
     def get_daily_stats(self):
-        """Fetches realized performance, fees, and funding from exchange ledger"""
         try:
             now = int(time.time() * 1000)
             since = now - 86400000
@@ -481,7 +423,6 @@ class ExecutionManager:
             return None
 
     def _emergency_market_close(self):
-        """Panic close all open positions and cancel all orders"""
         self.exchange.cancel_all_orders(params={'category': 'linear'})
         positions = self.exchange.fetch_positions(params={'category': 'linear'})
         for pos in positions:
