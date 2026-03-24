@@ -12,10 +12,12 @@ try:
     from utils.tg_wrapper import TelegramReporter
 except ImportError:
     import sys
+
     root_path = Path(__file__).resolve().parent.parent
     if str(root_path) not in sys.path:
         sys.path.append(str(root_path))
     from utils.tg_wrapper import TelegramReporter
+
 
 class PairMonitor:
     """
@@ -23,6 +25,10 @@ class PairMonitor:
     Responsible for real-time Z-Score monitoring and Rolling Beta drift detection.
     Updated: Now fully supports Half-Life capture for Time-based Exits.
     """
+
+    # 🚀 [新增] 系統版本號同步
+    VERSION = "v2.3.0-Stable"
+
     root_dir = Path(__file__).resolve().parent.parent
     result_folder = root_dir / 'result'
     log_filepath = result_folder / 'master_research_log.csv'
@@ -33,7 +39,8 @@ class PairMonitor:
         self.exchange = ccxt.bybit({'enableRateLimit': True})
         self.tg = TelegramReporter()
         self.signal_folder.mkdir(parents=True, exist_ok=True)
-        logger.info('🛰️ PairMonitor scanner deployed with Rolling Beta & Half-Life support')
+        # 於啟動日誌中顯示版本號
+        logger.info(f'🛰️ PairMonitor {self.VERSION} scanner deployed with Rolling Beta & Half-Life support')
 
     def fetch_latest_prices(self, symbols):
         """Fetches real-time tickers for a list of symbols"""
@@ -69,7 +76,9 @@ class PairMonitor:
             # Rolling Beta Calculation (OLS)
             x = sm.add_constant(p2)
             model = sm.OLS(p1, x).fit()
-            rolling_beta = model.params[1]
+
+            # ✅ [SCO FIX] 修復 Pandas 索引報錯 KeyError: 1，改用 .iloc[1]
+            rolling_beta = float(model.params.iloc[1])
 
             # Calculate Drift Percentage
             drift = abs(rolling_beta - historical_beta) / historical_beta if historical_beta != 0 else 0
@@ -100,7 +109,7 @@ class PairMonitor:
             'z_score': round(z_score, 4),
             'beta': beta,
             'rolling_beta': round(r_beta, 4),
-            'half_life': round(half_life, 2), # <--- [OPTIMIZATION] Capture Half-Life
+            'half_life': round(half_life, 2),  # <--- [OPTIMIZATION] Capture Half-Life
             'status': 'PENDING'
         }
 
