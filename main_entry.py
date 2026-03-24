@@ -104,25 +104,17 @@ def week_schedule():
     """每週大掃描：重新篩選共整合組合"""
     logger.info("📅 每週戰略研究啟動：更新獵物清單...")
     try:
-        # 🛡️ 智能探測：自動尋找 MarketScanner 內可用的執行函數
-        scan_method = getattr(scanner, 'scan_market', getattr(scanner, 'run', getattr(scanner, 'execute',
-                                                                                      getattr(scanner, 'fetch_data',
-                                                                                              None))))
-        if callable(scan_method):
-            scan_method()
-        else:
-            logger.warning("⚠️ 找不到 MarketScanner 的執行函數，請確認 core/mkt_scan.py 的函數名稱。")
+        # 1. 執行市場掃描，並獲取 top_coins 列表 (預設抓前 24 名，回溯 41 天)
+        top_coins = scanner.get_top_volume_coins(num_coins=24, days_back=41, timeframe='1h')
 
-        # 🛡️ 智能探測：自動尋找 PairCombine 內可用的執行函數
-        screen_method = getattr(screener, 'screen_pairs', getattr(screener, 'run', getattr(screener, 'execute',
-                                                                                           getattr(screener, 'analyze',
-                                                                                                   None))))
-        if callable(screen_method):
-            screen_method()
+        # 2. 確認有成功抓到幣種清單後，將清單傳遞給共整合篩選器
+        if top_coins and len(top_coins) > 0:
+            logger.info(f"🔄 準備將 {len(top_coins)} 隻幣種交給 PairCombine 進行共整合運算...")
+            screener.pair_screener(coin_list=top_coins, timeframe='1h')
+            logger.success("✅ 獵物清單 (master_research_log.csv) 已更新。")
         else:
-            logger.warning("⚠️ 找不到 PairCombine 的執行函數，請確認 core/pair_screen.py 的函數名稱。")
+            logger.warning("⚠️ MarketScanner 未能回傳幣種清單，跳過共整合運算。")
 
-        logger.success("✅ 獵物清單 (master_research_log.csv) 已更新。")
     except Exception as e:
         logger.error(f"❌ 每週掃描失敗: {e}")
 
