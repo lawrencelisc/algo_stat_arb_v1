@@ -1,20 +1,31 @@
 import schedule
 import time
 import pandas as pd
+import sys
 from pathlib import Path
 from loguru import logger
 from datetime import datetime
 
+# --- 路徑自愈邏輯 ---
+root_path = Path(__file__).resolve().parent
+if str(root_path) not in sys.path:
+    sys.path.append(str(root_path))
+
 # 引入核心模組
-from core.mkt_scan import MarketScanner
-from core.pair_screen import PairCombine
-from core.pair_monitor import PairMonitor
-from utils.execution import ExecutionManager
-from utils.tg_wrapper import TelegramReporter
+try:
+    from core.mkt_scan import MarketScanner
+    from core.pair_screen import PairCombine
+    from core.pair_monitor import PairMonitor
+    from utils.execution import ExecutionManager
+    from utils.tg_wrapper import TelegramReporter
+except ImportError as e:
+    logger.error(f"❌ 模組載入失敗，請檢查目錄結構: {e}")
+    sys.exit(1)
 
 # ==========================================
-# 🛰️ 戰術配置中心
+# 🛰️ 戰術配置中心 v2.3-Stable
 # ==========================================
+VERSION = "v2.3.0-Stable"
 BUDGET_PER_PAIR = 100.0  # 每對組合預算
 DRAWDOWN_LIMIT = 100.0  # 利潤回撤容忍額度 (Strategy 2)
 TRADE_LOG = Path("data/trade/trade_record.csv")
@@ -28,25 +39,19 @@ tg = TelegramReporter()
 
 
 def hourly_zscore_check():
-    """
-    每小時巡邏任務：監控 Z-Score 並執行風險管理優化。
-    整合：Strategy 1 (Time Exit) 與 Strategy 2 (Profit Guard)。
-    """
-    logger.info("🛰️ 定時巡邏啟動：正在掃描獵場與執行風險審計...")
+    """每小時巡邏任務：監控 Z-Score 並執行風險管理優化"""
+    logger.info(f"🛰️ 定時巡邏啟動 (Main {VERSION})：正在掃描獵場與執行風險審計...")
 
     try:
         # ---------------------------------------------------------
         # 🛡️ [OPTIMIZATION 2] Profit Guard (利潤斷路器)
         # ---------------------------------------------------------
-        # 先獲取帳戶總權益
         bal = executor.exchange.fetch_balance()
-        # Bybit UTA 帳戶權益讀取
         current_equity = float(bal['info']['result']['list'][0]['totalEquity'])
 
-        # 檢查是否觸發高水位線回撤 (100 USDT)
         if executor.check_profit_guard(current_equity, drawdown_limit=DRAWDOWN_LIMIT):
             tg.send_error_alert("PROFIT GUARD TRIGGERED", "MainTower",
-                                f"Equity {current_equity}U dropped from peak. Panic Close All executed.")
+                                f"Equity {current_equity}U dropped. Panic Close executed.")
             return  # 若觸發全場平倉，本次巡邏結束
 
         # ---------------------------------------------------------
@@ -54,35 +59,35 @@ def hourly_zscore_check():
         # ---------------------------------------------------------
         if TRADE_LOG.exists():
             df_trades = pd.read_csv(TRADE_LOG)
-            # 找出目前標記為 OPEN 的倉位
             open_trades = df_trades[df_trades['status'] == 'OPEN']
 
-            for idx, row in open_trades.iterrows():
-                pair = row['pair']
-
-                # 獲取該部位的實時未實現盈虧 (用於判斷是否獲利中)
-                # 這裡調用 Bybit API 獲取部位資訊
+            if not open_trades.empty:
+                logger.info(f"🔎 正在檢查 {len(open_trades)} 個活動持倉的持有時間...")
                 positions = executor.exchange.fetch_positions(params={'category': 'linear'})
-                # 找到對應的標的 (以 S1 作為代表檢查)
-                pos_info = next((p for p in positions if p['symbol'].replace(':USDT', '') == row['s1']), None)
-                unrealized_pnl = float(pos_info['unrealizedPnl']) if pos_info else 0.0
 
-                # 執行超時檢查：持有時間 > 3 * Half-life 且 PnL > 0
-                if executor.check_time_exit(pair, row['entry_time'], row['opening_half_life'], unrealized_pnl):
-                    # 執行該部位平倉
-                    executor._emergency_market_close()  # 這裡建議使用針對單一對組合的平倉函數，目前先用 emergency
-                    tg.send_heartbeat(0.0, 0, f"⏳ Time-Exit executed for {pair}. Profit secured.")
+                for idx, row in open_trades.iterrows():
+                    pair = row['pair']
+
+                    # ⚠️ 防呆機制：相容舊帳本，如果沒有 opening_half_life 就預設為 8.0
+                    half_life = row.get('opening_half_life', 8.0)
+                    if pd.isna(half_life):
+                        half_life = 8.0
+
+                    pos_info = next((p for p in positions if p['symbol'].replace(':USDT', '') == row['s1']), None)
+                    unrealized_pnl = float(pos_info['unrealizedPnl']) if pos_info else 0.0
+
+                    # 檢查是否超時
+                    if executor.check_time_exit(pair, row['entry_time'], float(half_life), unrealized_pnl):
+                        # ✅ v2.3 精準平倉：只平嗰一對，唔會誤傷其他！
+                        success = executor.close_specific_pair(pair, reason="TIME_EXIT")
+                        if success:
+                            tg.send_heartbeat(0.0, 0, f"⏳ Time-Exit executed for {pair}. Profit secured.")
 
         # ---------------------------------------------------------
         # 🎯 標規動作：Z-Score 監控與落單執行
         # ---------------------------------------------------------
-        # 1. 雷達掃描現價，並產出信號到 signal_table.csv
         monitor.check_all_pairs()
-
-        # 2. 執行引擎讀取信號並執行下單
         executor.process_signals()
-
-        # 3. 定期對帳，確保與交易所同步
         executor.reconcile_positions()
 
     except Exception as e:
@@ -94,8 +99,14 @@ def week_schedule():
     """每週大掃描：重新篩選共整合組合"""
     logger.info("📅 每週戰略研究啟動：更新獵物清單...")
     try:
-        scanner.scan_market()
-        screener.screen_pairs()
+        # ⚠️ 注意：如果您的 MarketScanner 函數唔係叫 scan_market()，請喺度修改
+        if hasattr(scanner, 'scan_market'):
+            scanner.scan_market()
+        elif hasattr(scanner, 'run'):
+            scanner.run()
+
+        if hasattr(screener, 'screen_pairs'):
+            screener.screen_pairs()
         logger.success("✅ 獵物清單 (master_research_log.csv) 已更新。")
     except Exception as e:
         logger.error(f"❌ 每週掃描失敗: {e}")
@@ -105,17 +116,16 @@ def week_schedule():
 # 🚀 啟動調度引擎
 # ==========================================
 if __name__ == "__main__":
-    logger.info("🚢 Stat-Arb v2.1 潛艇離港，正在啟動自動化指揮系統...")
+    logger.info(f"🚢 Stat-Arb {VERSION} 潛艇離港，正在啟動自動化指揮系統...")
 
-    # [SCO FIX] 啟動時立即執行一次，確保不漏掉當前機會
+    # 啟動時執行一次
     week_schedule()
     hourly_zscore_check()
 
-    # 每週一凌晨 04:00 執行大掃描
     schedule.every().monday.at("04:00").do(week_schedule)
-
-    # 每小時執行一次 Z-Score 巡邏與風險優化
     schedule.every().hour.at(":01").do(hourly_zscore_check)
+
+    logger.info("✅ (BOOT) Initial sequence completed. Transitioning to Scheduled Mode.")
 
     while True:
         try:
@@ -124,3 +134,6 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             logger.warning("🛑 艦長手動中止程式。")
             break
+        except Exception as e:
+            logger.error(f"🚨 系統心跳異常: {e}")
+            time.sleep(10)
