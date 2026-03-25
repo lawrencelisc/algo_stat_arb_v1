@@ -2,65 +2,108 @@ import os
 import pandas as pd
 import numpy as np
 import ccxt
-import statsmodels.api as sm
 from pathlib import Path
 from loguru import logger
 from datetime import datetime, timezone
 
+
 class PairMonitor:
-    VERSION = "v3.0.0-Stable"
+
+    VERSION = "v3.1.0-Stable"
+
+    # 定義路徑 (對齊 algo_stat_arb_v1 架構)
+    root_dir = Path(__file__).resolve().parent.parent
+    result_folder = root_dir / 'result'
+    log_filepath = result_folder / 'master_research_log.csv'
+
+    # 🛡️ 定位攻擊指令存放處
+    signal_folder = root_dir / 'data' / 'signal'
+    signal_table_path = signal_folder / 'signal_table.csv'
 
     def __init__(self):
         self.exchange = ccxt.bybit({'enableRateLimit': True})
-        self.root_dir = Path(__file__).resolve().parent.parent
-        self.log_filepath = self.root_dir / 'result' / 'master_research_log.csv'
-        self.signal_table_path = self.root_dir / 'data' / 'signal' / 'signal_table.csv'
-        logger.info(f'🛰️ PairMonitor {self.VERSION} radar online.')
+        self.signal_folder.mkdir(parents=True, exist_ok=True)
+        logger.info('🛰️ PairMonitor scanner deployed with Half-Life & LOG-SCALE support')
 
     def fetch_latest_prices(self, symbols):
+        """獲取實時報價"""
         try:
             mapping = {f"{s.replace('USDT', '')}/USDT:USDT": s for s in symbols}
-            tickers = self.exchange.fetch_tickers(list(mapping.keys()), params={'category': 'linear'})
-            return {mapping[k]: float(v['last']) for k, v in tickers.items() if k in mapping}
-        except: return {}
+            ccxt_symbols = list(mapping.keys())
+            tickers = self.exchange.fetch_tickers(ccxt_symbols, params={'category': 'linear'})
 
-    def _check_beta_drift(self, s1, s2, historical_beta):
-        """修復 iloc[1] 索引錯誤"""
-        try:
-            sym1 = f"{s1.replace('USDT', '')}/USDT:USDT"
-            sym2 = f"{s2.replace('USDT', '')}/USDT:USDT"
-            ohlcv1 = self.exchange.fetch_ohlcv(sym1, timeframe='1h', limit=24)
-            ohlcv2 = self.exchange.fetch_ohlcv(sym2, timeframe='1h', limit=24)
-            p1, p2 = pd.Series([x[4] for x in ohlcv1]), pd.Series([x[4] for x in ohlcv2])
-            x = sm.add_constant(p2)
-            model = sm.OLS(p1, x).fit()
-            rolling_beta = float(model.params.iloc[1]) # ✅ 使用 iloc[1]
-            drift = abs(rolling_beta - historical_beta) / historical_beta if historical_beta != 0 else 0
-            return rolling_beta, drift
-        except: return historical_beta, 0.0
+            prices = {}
+            for ccxt_id, data in tickers.items():
+                if ccxt_id in mapping:
+                    csv_key = mapping[ccxt_id]
+                    prices[csv_key] = float(data['last'])
+            return prices
+        except Exception as e:
+            logger.error(f"❌ Error fetching prices from Bybit: {e}")
+            return {}
 
     def generate_signal(self, pair_name, s1, s2, z_score, beta, half_life):
-        r_beta, drift = self._check_beta_drift(s1, s2, beta)
-        signal = {
+        """
+        [PHASE 1 UPGRADE] 新增 half_life 參數
+        產出指令並傳遞預期壽命數據
+        """
+        if self.signal_table_path.exists():
+            df_existing = pd.read_csv(self.signal_table_path)
+            is_pending = df_existing[(df_existing['pair'] == pair_name) & (df_existing['status'] == 'PENDING')]
+            if not is_pending.empty:
+                return
+
+        side1 = 'BUY' if z_score < -2.0 else 'SELL'
+        side2 = 'SELL' if z_score < -2.0 else 'BUY'
+
+        signal_entry = {
             'timestamp': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
-            'pair': pair_name, 's1': s1, 's2': s2,
-            'side1': 'BUY' if z_score < -2.0 else 'SELL',
-            'side2': 'SELL' if z_score < -2.0 else 'BUY',
-            'z_score': round(z_score, 4), 'beta': beta, 'rolling_beta': round(r_beta, 4),
-            'half_life': round(half_life, 2), 'status': 'PENDING'
+            'pair': pair_name,
+            's1': s1, 's2': s2,
+            'side1': side1, 'side2': side2,
+            'z_score': round(z_score, 4),
+            'beta': beta,
+            'half_life': round(half_life, 2),  # <--- 將半衰期數據寫入指令表
+            'status': 'PENDING'
         }
-        pd.DataFrame([signal]).to_csv(self.signal_table_path, mode='a', index=False, header=not self.signal_table_path.exists())
-        logger.success(f"🎯 SIGNAL: {pair_name} [Drift: {drift:.1%}]")
+
+        df_new = pd.DataFrame([signal_entry])
+        file_exists = self.signal_table_path.exists()
+        df_new.to_csv(self.signal_table_path, mode='a', index=False, header=not file_exists)
+        logger.success(f"🎯 SIGNAL: {pair_name} (Z: {z_score:.2f}, HL: {half_life:.1f}h)")
 
     def check_all_pairs(self):
-        if not self.log_filepath.exists(): return
-        df = pd.read_csv(self.log_filepath)
-        latest = df[df['timestamp'] == df['timestamp'].max()]
-        watchlist = latest[latest['p_value'] < 0.05]
-        prices = self.fetch_latest_prices(list(set(watchlist['s1'].tolist() + watchlist['s2'].tolist())))
-        for _, row in watchlist.iterrows():
-            if row['s1'] in prices and row['s2'] in prices:
-                z = (prices[row['s1']] - (float(row['beta']) * prices[row['s2']] + float(row['alpha']))) / float(row['spread_std'])
-                logger.info(f"📊 {row['pair']:20} | Z: {z:6.2f}")
-                if abs(z) >= 2.0:
-                    self.generate_signal(row['pair'], row['s1'], row['s2'], z, row['beta'], row['half_life'])
+        """監控主邏輯"""
+        if not self.log_filepath.exists():
+            logger.warning(f"⚠️ Research log not found")
+            return
+
+        try:
+            df_pairs = pd.read_csv(self.log_filepath)
+            latest_ts = df_pairs['timestamp'].max()
+            df_latest = df_pairs[df_pairs['timestamp'] == latest_ts]
+            watchlist = df_latest[df_latest['p_value'] < 0.05].copy()
+
+            if watchlist.empty: return
+
+            all_needed_symbols = list(set(watchlist['s1'].tolist() + watchlist['s2'].tolist()))
+            current_prices = self.fetch_latest_prices(all_needed_symbols)
+
+            for index, row in watchlist.iterrows():
+                s1, s2 = row['s1'], row['s2']
+                if s1 in current_prices and s2 in current_prices:
+                    p1, p2 = current_prices[s1], current_prices[s2]
+                    beta, alpha, std = float(row['beta']), float(row['alpha']), float(row['spread_std'])
+
+                    # 🎯 絕對核心修復：把抓到的實時價格轉成「對數 (Log)」才能和 Log-Beta 對話！
+                    p1_log = np.log(p1)
+                    p2_log = np.log(p2)
+
+                    # 現在這裡的單位終於對齊了！
+                    z_score = (p1_log - (beta * p2_log + alpha)) / std
+                    pair_name = row['pair']
+
+                    if abs(z_score) >= 2.0:
+                        self.generate_signal(pair_name, s1, s2, z_score, beta, row['half_life'])
+        except Exception as e:
+            logger.error(f"❌ Critical error in monitor: {e}")

@@ -105,6 +105,7 @@ class PairCombine:
                 spread = y - (beta * x + alpha)
                 half_life = self.calculate_half_life(spread)
 
+                # OLS 的殘差平均值理論上無限趨近於 0
                 spread_mean = spread.mean()
                 spread_std = spread.std()
                 last_z_score = (spread.iloc[-1] - spread_mean) / spread_std if spread_std != 0 else 0
