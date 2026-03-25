@@ -10,7 +10,7 @@ from streamlit_autorefresh import st_autorefresh
 # ==========================================
 # 🛰️ 網頁配置與自定義 CSS
 # ==========================================
-VERSION = "v3.0.1-Stable"
+VERSION = "v3.0.3-Stable"
 
 st.set_page_config(
     page_title=f"Stat-Arb {VERSION} UI",
@@ -159,23 +159,36 @@ with m4:
 # ==========================================
 tab1, tab2, tab3 = st.tabs(["🔥 Active Positions", "🎯 Real-time Radar", "📜 Historical Logs"])
 
-# --- Tab 1: 活躍持倉 (回歸純表格模式) ---
+# --- Tab 1: 活躍持倉 (完美紅綠對齊) ---
 with tab1:
     if not active_df.empty:
         # 準備表格顯示格式
         display_df = active_df.copy()
         display_df['entry_time'] = display_df['entry_time'].dt.strftime('%m-%d %H:%M')
 
-        # 標註動作方向 (Side)
+        # 標註動作方向 (Action) - 帶入紅綠燈
         display_df['Action'] = display_df.apply(
             lambda r: f"🔴 Short {r['s1'].replace('USDT', '')} / Long {r['s2'].replace('USDT', '')}" if float(r[
                                                                                                                  'peak_z_score']) > 0 else f"🟢 Long {r['s1'].replace('USDT', '')} / Short {r['s2'].replace('USDT', '')}",
             axis=1)
 
-        # 強制加入 +/- 符號
-        display_df['Peak Z'] = display_df['peak_z_score'].apply(lambda x: f"{float(x):+.2f}")
-        display_df['Current Z'] = display_df['Current Z'].apply(
-            lambda x: f"{float(x):+.2f}" if pd.notna(x) else "Wait Scan...")
+
+        # 強制為 Z-Score 加入 Emoji 與 +/- 符號
+        def format_z_with_emoji(x):
+            if pd.isna(x): return "Wait Scan..."
+            try:
+                val = float(x)
+                if val > 0: return f"🔴 {val:+.2f}"
+                if val < 0: return f"🟢 {val:+.2f}"
+                return f"{val:+.2f}"
+            except:
+                return str(x)
+
+
+        display_df['Peak Z'] = display_df['peak_z_score'].apply(format_z_with_emoji)
+        display_df['Current Z'] = display_df['Current Z'].apply(format_z_with_emoji)
+
+        # PnL 格式化
         display_df['Live PnL'] = display_df['Live PnL_num'].apply(
             lambda x: f"{x:+.2f} USDT" if pd.notna(x) else "Loading...")
 
@@ -184,15 +197,11 @@ with tab1:
         show_df = display_df[cols]
 
 
-        # Pandas 顏色渲染引擎
-        def style_z(val):
-            if val == "Wait Scan...": return ''
-            try:
-                num = float(val)
-                if num > 0: return 'color: #ff4b4b; font-weight: bold;'
-                if num < 0: return 'color: #00ff00; font-weight: bold;'
-            except:
-                pass
+        # Pandas 顏色渲染引擎 (偵測字串內的 Emoji 進行整格上色)
+        def style_z_action(val):
+            if not isinstance(val, str): return ''
+            if '🔴' in val: return 'color: #ff4b4b; font-weight: bold;'
+            if '🟢' in val: return 'color: #00ff00; font-weight: bold;'
             return ''
 
 
@@ -207,38 +216,18 @@ with tab1:
             return 'color: white;'
 
 
-        def style_action(val):
-            if '🔴' in val: return 'color: #ff4b4b; font-weight: bold;'
-            if '🟢' in val: return 'color: #00ff00; font-weight: bold;'
-            return ''
-
-
         # 應用顏色
         styled_df = (show_df.style
-                     .map(style_z, subset=['Peak Z', 'Current Z'])
-                     .map(style_pnl, subset=['Live PnL'])
-                     .map(style_action, subset=['Action']))
+                     .map(style_z_action, subset=['Action', 'Peak Z', 'Current Z'])
+                     .map(style_pnl, subset=['Live PnL']))
 
         st.dataframe(styled_df, use_container_width=True, hide_index=True)
 
-        # 💡 英文註解與邏輯說明區塊 (放置於表格下方)
+        # 💡 極簡版邏輯說明區塊 (放置於表格下方)
         st.markdown("""
-        <div style="background-color: #1e2130; border: 1px solid #3e4259; padding: 18px; border-radius: 8px; margin-top: 20px;">
-            <h5 style="color: #e2e8f0; margin-bottom: 12px; font-size: 1.1rem;">💡 Position Actions & Logic Annotations</h5>
-            <div style="color: #94a3b8; font-size: 0.95rem; line-height: 1.6;">
-                <p style="margin-bottom: 10px;">
-                    <span style="color: #ff4b4b; font-weight: bold; font-size: 1.05rem;">🔴 +Z (Positive Peak Z) ➡️ SELL Spread:</span><br>
-                    • <b>Reason:</b> The 1st coin is mathematically <i>overvalued</i> compared to the 2nd coin.<br>
-                    • <b>Action:</b> System executes <b>Short 1st Coin & Long 2nd Coin</b>.<br>
-                    • <b>Take Profit:</b> You make money as the <span style="color: #ff4b4b;">Current Z drops back towards 0</span>.
-                </p>
-                <p style="margin-bottom: 0;">
-                    <span style="color: #00ff00; font-weight: bold; font-size: 1.05rem;">🟢 -Z (Negative Peak Z) ➡️ BUY Spread:</span><br>
-                    • <b>Reason:</b> The 1st coin is mathematically <i>undervalued</i> compared to the 2nd coin.<br>
-                    • <b>Action:</b> System executes <b>Long 1st Coin & Short 2nd Coin</b>.<br>
-                    • <b>Take Profit:</b> You make money as the <span style="color: #00ff00;">Current Z rises back towards 0</span>.
-                </p>
-            </div>
+        <div style="background-color: #1e2130; border: 1px solid #3e4259; padding: 10px 15px; border-radius: 8px; margin-top: 15px; font-size: 0.82rem; color: #94a3b8; line-height: 1.6;">
+            <span style="color: #ff4b4b; font-weight: bold;">🔴 +Z (SELL Spread):</span> 1st Coin Overvalued ➡️ <b>Short 1st / Long 2nd</b> ➡️ Profit as Z drops to 0.<br>
+            <span style="color: #00ff00; font-weight: bold;">🟢 -Z (BUY Spread):</span> 1st Coin Undervalued ➡️ <b>Long 1st / Short 2nd</b> ➡️ Profit as Z rises to 0.
         </div>
         """, unsafe_allow_html=True)
 
@@ -274,9 +263,16 @@ with tab2:
 
 
             # 顏色渲染邏輯
-            def style_z(val):
-                color = '#ff4b4b' if val >= 2.0 else '#00ff00' if val <= -2.0 else 'white'
-                return f'color: {color}; font-weight: bold;'
+            def style_z_radar(val):
+                if pd.isna(val): return ''
+                if val >= 0: return 'color: #ff4b4b; font-weight: bold;'
+                if val < 0: return 'color: #00ff00; font-weight: bold;'
+                return ''
+
+
+            def format_z_radar(val):
+                if val >= 0: return f"🔴 {val:+.2f}"
+                return f"🟢 {val:+.2f}"
 
 
             def style_p(val):
@@ -285,15 +281,15 @@ with tab2:
 
 
             def style_signal(val):
-                if 'Short 1' in val: return 'color: #ff4b4b; font-weight: bold;'
-                if 'Long 1' in val: return 'color: #00ff00; font-weight: bold;'
+                if '🔴' in val: return 'color: #ff4b4b; font-weight: bold;'
+                if '🟢' in val: return 'color: #00ff00; font-weight: bold;'
                 if 'Weak' in val: return 'color: salmon;'
                 return 'color: #a0a0a0;'
 
 
             styled_df = (show_df.style
-                         .format({'Z-Score': '{:+.2f}', 'P-Value': '{:.4f}', 'Beta': '{:.4f}'})
-                         .map(style_z, subset=['Z-Score'])
+                         .format({'Z-Score': format_z_radar, 'P-Value': '{:.4f}', 'Beta': '{:.4f}'})
+                         .map(style_z_radar, subset=['Z-Score'])
                          .map(style_p, subset=['P-Value'])
                          .map(style_signal, subset=['Signal Status']))
 
