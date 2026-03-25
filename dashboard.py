@@ -10,7 +10,7 @@ from streamlit_autorefresh import st_autorefresh
 # ==========================================
 # 🛰️ 網頁配置與自定義 CSS
 # ==========================================
-VERSION = "v3.0.3-Stable"
+VERSION = "v3.0.5-Stable"
 
 st.set_page_config(
     page_title=f"Stat-Arb {VERSION} UI",
@@ -166,20 +166,20 @@ with tab1:
         display_df = active_df.copy()
         display_df['entry_time'] = display_df['entry_time'].dt.strftime('%m-%d %H:%M')
 
-        # 標註動作方向 (Action) - 帶入紅綠燈
+        # 標註動作方向 (Action) - 帶入紅綠燈 (正數綠色，負數紅色)
         display_df['Action'] = display_df.apply(
-            lambda r: f"🔴 Short {r['s1'].replace('USDT', '')} / Long {r['s2'].replace('USDT', '')}" if float(r[
-                                                                                                                 'peak_z_score']) > 0 else f"🟢 Long {r['s1'].replace('USDT', '')} / Short {r['s2'].replace('USDT', '')}",
+            lambda r: f"🟢 Short {r['s1'].replace('USDT', '')} / Long {r['s2'].replace('USDT', '')}" if float(r[
+                                                                                                                 'peak_z_score']) > 0 else f"🔴 Long {r['s1'].replace('USDT', '')} / Short {r['s2'].replace('USDT', '')}",
             axis=1)
 
 
-        # 強制為 Z-Score 加入 Emoji 與 +/- 符號
+        # 強制為 Z-Score 加入 Emoji 與 +/- 符號 (正數綠色，負數紅色)
         def format_z_with_emoji(x):
             if pd.isna(x): return "Wait Scan..."
             try:
                 val = float(x)
-                if val > 0: return f"🔴 {val:+.2f}"
-                if val < 0: return f"🟢 {val:+.2f}"
+                if val > 0: return f"🟢 {val:+.2f}"
+                if val < 0: return f"🔴 {val:+.2f}"
                 return f"{val:+.2f}"
             except:
                 return str(x)
@@ -188,20 +188,26 @@ with tab1:
         display_df['Peak Z'] = display_df['peak_z_score'].apply(format_z_with_emoji)
         display_df['Current Z'] = display_df['Current Z'].apply(format_z_with_emoji)
 
+        # 新增價格與 ln(Beta) 欄位
+        display_df['Live P1'] = display_df['s1'].map(live_prices).apply(lambda x: f"{x:.4f}" if pd.notna(x) else "N/A")
+        display_df['Live P2'] = display_df['s2'].map(live_prices).apply(lambda x: f"{x:.4f}" if pd.notna(x) else "N/A")
+        display_df['ln(Beta)'] = display_df['beta'].apply(lambda x: f"{float(x):.4f}")
+
         # PnL 格式化
         display_df['Live PnL'] = display_df['Live PnL_num'].apply(
             lambda x: f"{x:+.2f} USDT" if pd.notna(x) else "Loading...")
 
         # 選擇顯示欄位
-        cols = ['entry_time', 'pair', 'Action', 'Peak Z', 'Current Z', 'Live PnL', 'Time Left']
+        cols = ['entry_time', 'pair', 'Action', 'Live P1', 'Live P2', 'ln(Beta)', 'Peak Z', 'Current Z', 'Live PnL',
+                'Time Left']
         show_df = display_df[cols]
 
 
         # Pandas 顏色渲染引擎 (偵測字串內的 Emoji 進行整格上色)
         def style_z_action(val):
             if not isinstance(val, str): return ''
-            if '🔴' in val: return 'color: #ff4b4b; font-weight: bold;'
             if '🟢' in val: return 'color: #00ff00; font-weight: bold;'
+            if '🔴' in val: return 'color: #ff4b4b; font-weight: bold;'
             return ''
 
 
@@ -226,8 +232,8 @@ with tab1:
         # 💡 極簡版邏輯說明區塊 (放置於表格下方)
         st.markdown("""
         <div style="background-color: #1e2130; border: 1px solid #3e4259; padding: 10px 15px; border-radius: 8px; margin-top: 15px; font-size: 0.82rem; color: #94a3b8; line-height: 1.6;">
-            <span style="color: #ff4b4b; font-weight: bold;">🔴 +Z (SELL Spread):</span> 1st Coin Overvalued ➡️ <b>Short 1st / Long 2nd</b> ➡️ Profit as Z drops to 0.<br>
-            <span style="color: #00ff00; font-weight: bold;">🟢 -Z (BUY Spread):</span> 1st Coin Undervalued ➡️ <b>Long 1st / Short 2nd</b> ➡️ Profit as Z rises to 0.
+            <span style="color: #00ff00; font-weight: bold;">🟢 +Z (SELL Spread):</span> 1st Coin Overvalued ➡️ <b>Short 1st / Long 2nd</b> ➡️ Profit as Z drops to 0.<br>
+            <span style="color: #ff4b4b; font-weight: bold;">🔴 -Z (BUY Spread):</span> 1st Coin Undervalued ➡️ <b>Long 1st / Short 2nd</b> ➡️ Profit as Z rises to 0.
         </div>
         """, unsafe_allow_html=True)
 
@@ -247,32 +253,35 @@ with tab2:
             df_plot['Pair'] = df_plot['pair'].str.replace('USDT', '')
             df_plot['Z-Score'] = df_plot['last_z_score'].apply(float)
             df_plot['P-Value'] = df_plot['p_value'].apply(float)
-            df_plot['Beta'] = df_plot['beta'].apply(float)
+            df_plot['ln(Beta)'] = df_plot['beta'].apply(float)
+            df_plot['P1'] = df_plot['last_p1'].apply(lambda x: f"{float(x):.4f}" if pd.notna(x) else "N/A")
+            df_plot['P2'] = df_plot['last_p2'].apply(lambda x: f"{float(x):.4f}" if pd.notna(x) else "N/A")
 
 
             def get_status(row):
                 z, p = row['Z-Score'], row['P-Value']
                 if p >= 0.05: return "⚠️ Weak Cointegration"
-                if z >= 2.0: return "🔴 Short 1 / Long 2"
-                if z <= -2.0: return "🟢 Long 1 / Short 2"
+                if z >= 2.0: return "🟢 Short 1 / Long 2"
+                if z <= -2.0: return "🔴 Long 1 / Short 2"
                 return "⏳ Wait for Divergence"
 
 
             df_plot['Signal Status'] = df_plot.apply(get_status, axis=1)
-            show_df = df_plot[['Pair', 'Z-Score', 'P-Value', 'Beta', 'Signal Status']]
+            show_df = df_plot[['Pair', 'P1', 'P2', 'Z-Score', 'P-Value', 'ln(Beta)', 'Signal Status']]
 
 
             # 顏色渲染邏輯
             def style_z_radar(val):
                 if pd.isna(val): return ''
-                if val >= 0: return 'color: #ff4b4b; font-weight: bold;'
-                if val < 0: return 'color: #00ff00; font-weight: bold;'
+                if val > 0: return 'color: #00ff00; font-weight: bold;'
+                if val < 0: return 'color: #ff4b4b; font-weight: bold;'
                 return ''
 
 
             def format_z_radar(val):
-                if val >= 0: return f"🔴 {val:+.2f}"
-                return f"🟢 {val:+.2f}"
+                if val > 0: return f"🟢 {val:+.2f}"
+                if val < 0: return f"🔴 {val:+.2f}"
+                return f"{val:+.2f}"
 
 
             def style_p(val):
@@ -281,14 +290,14 @@ with tab2:
 
 
             def style_signal(val):
-                if '🔴' in val: return 'color: #ff4b4b; font-weight: bold;'
                 if '🟢' in val: return 'color: #00ff00; font-weight: bold;'
+                if '🔴' in val: return 'color: #ff4b4b; font-weight: bold;'
                 if 'Weak' in val: return 'color: salmon;'
                 return 'color: #a0a0a0;'
 
 
             styled_df = (show_df.style
-                         .format({'Z-Score': format_z_radar, 'P-Value': '{:.4f}', 'Beta': '{:.4f}'})
+                         .format({'Z-Score': format_z_radar, 'P-Value': '{:.4f}', 'ln(Beta)': '{:.4f}'})
                          .map(style_z_radar, subset=['Z-Score'])
                          .map(style_p, subset=['P-Value'])
                          .map(style_signal, subset=['Signal Status']))
