@@ -10,7 +10,7 @@ from streamlit_autorefresh import st_autorefresh
 # ==========================================
 # 🛰️ 網頁配置與自定義 CSS
 # ==========================================
-VERSION = "v3.0.0-Stable"
+VERSION = "v3.0.1-Stable"
 
 st.set_page_config(
     page_title=f"Stat-Arb {VERSION} UI",
@@ -94,36 +94,48 @@ if not active_df.empty:
     unique_symbols = list(set(active_df['s1'].tolist() + active_df['s2'].tolist()))
     live_prices = fetch_live_prices(unique_symbols)
 
-    # 計算 PnL 與 Progress
     pnls = []
-    progress_list = []
+    time_left_list = []
+    current_utc_time = pd.Timestamp.utcnow()
+
     for idx, row in active_df.iterrows():
         try:
-            cur_z = row['Current Z']
             peak_z = float(row['peak_z_score'])
-
-            # Progress 計算: (1 - 現在Z/初始Z) * 100
-            if not pd.isna(cur_z) and peak_z != 0:
-                prog = (1 - (float(cur_z) / peak_z)) * 100
-                progress_list.append(prog)
-            else:
-                progress_list.append(0)
-
-            # PnL 計算
             cp1, cp2 = live_prices.get(row['s1']), live_prices.get(row['s2'])
+
+            # PnL 計算 (嚴格依照 peak_z 的方向)
             if cp1 and cp2:
                 ep1, ep2, q1, q2 = float(row['price1']), float(row['price2']), float(row['qty1']), float(row['qty2'])
-                pnl = ((ep1 - cp1) * q1 + (cp2 - ep2) * q2) if peak_z > 0 else ((cp1 - ep1) * q1 + (ep2 - cp2) * q2)
+                if peak_z > 0:
+                    pnl = (ep1 - cp1) * q1 + (cp2 - ep2) * q2  # Short 1, Long 2
+                else:
+                    pnl = (cp1 - ep1) * q1 + (ep2 - cp2) * q2  # Long 1, Short 2
                 pnls.append(pnl)
                 total_floating_pnl += pnl
             else:
                 pnls.append(None)
         except:
             pnls.append(None)
-            progress_list.append(0)
+
+        # Time Left 計算
+        try:
+            entry_t = pd.Timestamp(row['entry_time'])
+            if entry_t.tz is None: entry_t = entry_t.tz_localize('UTC')
+            hl = float(row.get('opening_half_life', 8.0))
+            time_limit_hours = hl * 3
+            deadline = entry_t + pd.Timedelta(hours=time_limit_hours)
+            remaining_time = deadline - current_utc_time
+            if remaining_time.total_seconds() > 0:
+                hours, rem = divmod(remaining_time.total_seconds(), 3600)
+                mins, _ = divmod(rem, 60)
+                time_left_list.append(f"{int(hours)}h {int(mins)}m")
+            else:
+                time_left_list.append("Expired ⚠️")
+        except:
+            time_left_list.append("N/A")
 
     active_df['Live PnL_num'] = pnls
-    active_df['Progress'] = progress_list
+    active_df['Time Left'] = time_left_list
 
 # UI Header
 col_title, col_time = st.columns([3, 1])
@@ -147,52 +159,89 @@ with m4:
 # ==========================================
 tab1, tab2, tab3 = st.tabs(["🔥 Active Positions", "🎯 Real-time Radar", "📜 Historical Logs"])
 
-
-# ✅ 核心 HTML 上色函式：分辨 Z-Score 正負
-def get_z_color_html(z_val):
-    try:
-        z = float(z_val)
-        if z > 0:
-            return f'<span style="color: #ff4b4b; font-weight: bold;">+{z:.2f} 🔴</span>'
-        elif z < 0:
-            return f'<span style="color: #00ff00; font-weight: bold;">{z:.2f} 🟢</span>'
-        else:
-            return f'<span style="color: #ffffff; font-weight: bold;">{z:.2f}</span>'
-    except:
-        return f'<span style="color: #a0a0a0;">N/A</span>'
-
-
-# --- Tab 1: 活躍持倉 ---
+# --- Tab 1: 活躍持倉 (回歸純表格模式) ---
 with tab1:
     if not active_df.empty:
-        active_df['Side'] = active_df.apply(lambda r: f"🔴 Short {r['s1'].replace('USDT', '')}" if float(
-            r['peak_z_score']) > 0 else f"🟢 Long {r['s1'].replace('USDT', '')}", axis=1)
-        active_df['Live PnL'] = active_df['Live PnL_num'].apply(
+        # 準備表格顯示格式
+        display_df = active_df.copy()
+        display_df['entry_time'] = display_df['entry_time'].dt.strftime('%m-%d %H:%M')
+
+        # 標註動作方向 (Side)
+        display_df['Action'] = display_df.apply(
+            lambda r: f"🔴 Short {r['s1'].replace('USDT', '')} / Long {r['s2'].replace('USDT', '')}" if float(r[
+                                                                                                                 'peak_z_score']) > 0 else f"🟢 Long {r['s1'].replace('USDT', '')} / Short {r['s2'].replace('USDT', '')}",
+            axis=1)
+
+        # 強制加入 +/- 符號
+        display_df['Peak Z'] = display_df['peak_z_score'].apply(lambda x: f"{float(x):+.2f}")
+        display_df['Current Z'] = display_df['Current Z'].apply(
+            lambda x: f"{float(x):+.2f}" if pd.notna(x) else "Wait Scan...")
+        display_df['Live PnL'] = display_df['Live PnL_num'].apply(
             lambda x: f"{x:+.2f} USDT" if pd.notna(x) else "Loading...")
 
-        # 使用自定義表格，加入進度條與 Z-Score 顏色視覺效果
-        for idx, row in active_df.iterrows():
-            with st.expander(f"🚢 {row['pair']} | {row['Side']} | PnL: {row['Live PnL']}", expanded=True):
-                c1, c2, c3 = st.columns([1, 2, 1])
+        # 選擇顯示欄位
+        cols = ['entry_time', 'pair', 'Action', 'Peak Z', 'Current Z', 'Live PnL', 'Time Left']
+        show_df = display_df[cols]
 
-                # 取得帶顏色的 Z-Score HTML
-                cur_z_html = get_z_color_html(row['Current Z'])
-                peak_z_html = get_z_color_html(row['peak_z_score'])
 
-                c1.markdown(f"**Current Z:** {cur_z_html}", unsafe_allow_html=True)
-                c1.write(f"**Target:** $0.00$")
+        # Pandas 顏色渲染引擎
+        def style_z(val):
+            if val == "Wait Scan...": return ''
+            try:
+                num = float(val)
+                if num > 0: return 'color: #ff4b4b; font-weight: bold;'
+                if num < 0: return 'color: #00ff00; font-weight: bold;'
+            except:
+                pass
+            return ''
 
-                # 進度條顏色: 賺錢綠色，賠錢紅色
-                c2.write(f"Reversion Progress: **{row['Progress']:.1f}%**")
-                c2.progress(min(max(row['Progress'] / 100, 0.0), 1.0))
 
-                c3.markdown(f"**Peak Z:** {peak_z_html}", unsafe_allow_html=True)
-                pnl_color = "lightgreen" if row['Live PnL_num'] and row['Live PnL_num'] > 0 else "salmon" if row[
-                                                                                                                 'Live PnL_num'] and \
-                                                                                                             row[
-                                                                                                                 'Live PnL_num'] < 0 else "white"
-                c3.markdown(f"**PnL:** <span style='color:{pnl_color}; font-weight:bold;'>{row['Live PnL']}</span>",
-                            unsafe_allow_html=True)
+        def style_pnl(val):
+            if 'USDT' in str(val):
+                try:
+                    num = float(val.replace(' USDT', '').replace('+', ''))
+                    if num > 0: return 'color: #00ff00; font-weight: bold;'
+                    if num < 0: return 'color: #ff4b4b; font-weight: bold;'
+                except:
+                    pass
+            return 'color: white;'
+
+
+        def style_action(val):
+            if '🔴' in val: return 'color: #ff4b4b; font-weight: bold;'
+            if '🟢' in val: return 'color: #00ff00; font-weight: bold;'
+            return ''
+
+
+        # 應用顏色
+        styled_df = (show_df.style
+                     .map(style_z, subset=['Peak Z', 'Current Z'])
+                     .map(style_pnl, subset=['Live PnL'])
+                     .map(style_action, subset=['Action']))
+
+        st.dataframe(styled_df, use_container_width=True, hide_index=True)
+
+        # 💡 英文註解與邏輯說明區塊 (放置於表格下方)
+        st.markdown("""
+        <div style="background-color: #1e2130; border: 1px solid #3e4259; padding: 18px; border-radius: 8px; margin-top: 20px;">
+            <h5 style="color: #e2e8f0; margin-bottom: 12px; font-size: 1.1rem;">💡 Position Actions & Logic Annotations</h5>
+            <div style="color: #94a3b8; font-size: 0.95rem; line-height: 1.6;">
+                <p style="margin-bottom: 10px;">
+                    <span style="color: #ff4b4b; font-weight: bold; font-size: 1.05rem;">🔴 +Z (Positive Peak Z) ➡️ SELL Spread:</span><br>
+                    • <b>Reason:</b> The 1st coin is mathematically <i>overvalued</i> compared to the 2nd coin.<br>
+                    • <b>Action:</b> System executes <b>Short 1st Coin & Long 2nd Coin</b>.<br>
+                    • <b>Take Profit:</b> You make money as the <span style="color: #ff4b4b;">Current Z drops back towards 0</span>.
+                </p>
+                <p style="margin-bottom: 0;">
+                    <span style="color: #00ff00; font-weight: bold; font-size: 1.05rem;">🟢 -Z (Negative Peak Z) ➡️ BUY Spread:</span><br>
+                    • <b>Reason:</b> The 1st coin is mathematically <i>undervalued</i> compared to the 2nd coin.<br>
+                    • <b>Action:</b> System executes <b>Long 1st Coin & Short 2nd Coin</b>.<br>
+                    • <b>Take Profit:</b> You make money as the <span style="color: #00ff00;">Current Z rises back towards 0</span>.
+                </p>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
     else:
         st.success("✨ All clear! Scanning for new opportunities...")
 
@@ -243,24 +292,13 @@ with tab2:
 
 
             styled_df = (show_df.style
-                         .format({'Z-Score': '{:.2f}', 'P-Value': '{:.4f}', 'Beta': '{:.4f}'})
+                         .format({'Z-Score': '{:+.2f}', 'P-Value': '{:.4f}', 'Beta': '{:.4f}'})
                          .map(style_z, subset=['Z-Score'])
                          .map(style_p, subset=['P-Value'])
                          .map(style_signal, subset=['Signal Status']))
 
             st.dataframe(styled_df, use_container_width=True, hide_index=True, height=430)
 
-            st.markdown("""
-                <div style="background-color: #1e2130; border: 1px solid #3e4259; padding: 12px 18px; font-size: 0.8rem; color: #94a3b8; border-radius: 8px; margin-top: 10px;">
-                    <span style="color: #e2e8f0; font-weight: bold; font-size: 0.85rem;">💡 Entry Criteria:</span><br>
-                    <div style="margin-top: 4px;">
-                        • <b>P-Value:</b> Must be <code>< 0.05</code><br>
-                        • <b>Z-Score:</b> Absolute value must be <code>>= 2.0</code><br>
-                        <span style="margin-left: 15px;">🔴 <code>>= 2.0</code> : Short 1st Coin / Long 2nd Coin</span><br>
-                        <span style="margin-left: 15px;">🟢 <code><= -2.0</code>: Long 1st Coin / Short 2nd Coin</span>
-                    </div>
-                </div>
-            """, unsafe_allow_html=True)
         else:
             st.info("No scan data available.")
 
@@ -272,10 +310,6 @@ with tab2:
                                                                 {'range': [0.01, 0.05], 'color': "yellow"},
                                                                 {'range': [0.05, 0.1], 'color': "salmon"}]}))
             st.plotly_chart(fig_gauge, use_container_width=True)
-            st.markdown(
-                '<div style="display: flex; justify-content: center; gap: 15px; font-size: 0.85rem; color: #a0a0a0; margin-top: -20px;">'
-                '<div><span style="color: lightgreen;">●</span> Excellent</div><div><span style="color: yellow;">●</span> Good</div><div><span style="color: salmon;">●</span> Warning</div></div>',
-                unsafe_allow_html=True)
 
 # --- Tab 3: 歷史紀錄 ---
 with tab3:
