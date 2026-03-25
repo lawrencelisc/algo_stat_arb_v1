@@ -10,6 +10,7 @@ class DataBridge:
     [STAGE 0] 數據橋樑模組 (Data Bridge)
     負責從外部配置檔案（config.yaml）安全地讀取 API 金鑰與通訊配置。
     """
+    VERSION = "v3.0.0-Stable"
 
     def __init__(self):
         # 獲取專案根目錄下的配置路徑

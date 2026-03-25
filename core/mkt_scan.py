@@ -11,7 +11,7 @@ class MarketScanner:
     [STAGE 1] Market Scanner Module v2.4.0-Stable
     Responsible for dynamically identifying top liquid pairs and fetching historical OHLCV data.
     """
-    VERSION = "v2.4.0-Stable"
+    VERSION = "v3.0.0-Stable"
 
     def __init__(self):
         # Initialize Bybit exchange

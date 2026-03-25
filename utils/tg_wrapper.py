@@ -22,6 +22,8 @@ class TelegramReporter:
     負責格式化並發送系統信號、執行結果、異常警報與每日戰報。
     """
 
+    VERSION = "v3.0.0-Stable"
+
     def __init__(self):
         """
         初始化通訊官：透過 DataBridge 載入配置

@@ -22,9 +22,10 @@ except ImportError as e:
     sys.exit(1)
 
 # ==========================================
-# 🛰️ Tactical Configuration Center v2.4.2-Stable
+# 🛰️ Tactical Configuration Center v3.0-Stable
 # ==========================================
-VERSION = "v2.4.2-Stable"
+VERSION = "v3.0.0-Stable"
+
 BUDGET_PER_PAIR = 100.0
 DRAWDOWN_LIMIT = 100.0
 TRADE_LOG = Path("data/trade/trade_record.csv")

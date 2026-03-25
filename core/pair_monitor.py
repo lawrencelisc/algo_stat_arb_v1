@@ -8,7 +8,7 @@ from loguru import logger
 from datetime import datetime, timezone
 
 class PairMonitor:
-    VERSION = "v2.4.0-Stable"
+    VERSION = "v3.0.0-Stable"
 
     def __init__(self):
         self.exchange = ccxt.bybit({'enableRateLimit': True})

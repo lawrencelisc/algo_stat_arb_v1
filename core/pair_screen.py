@@ -10,11 +10,11 @@ from loguru import logger
 
 class PairCombine:
     """
-    [STAGE 2] Pair Screener Module v2.4.0-Stable
-    Responsible for calculating Cointegration, Correlation, Beta, Alpha, and Half-Life
-    for all possible combinations of the provided coin list.
+    [STAGE 2] Pair Screener Module v3.0.0-Stable
+    - ULTIMATE FIX: Log-Price Transformation Applied.
+    - Beta is now Elasticity (Log-Beta) to ensure Dollar-Neutrality.
     """
-    VERSION = "v2.4.0-Stable"
+    VERSION = "v3.0.0-Stable"
 
     def __init__(self):
         # Robust path resolution
@@ -53,9 +53,7 @@ class PairCombine:
 
     def pair_screener(self, coin_list, timeframe='1h'):
         """
-        Fully automated cointegration scan and database logging system.
-        :param coin_list: List of coins to scan (e.g. ['BTCUSDT', 'ETHUSDT'...])
-        :param timeframe: Resampling timeframe (e.g. '1h')
+        Fully automated cointegration scan using Log-Prices.
         """
         logger.info(f"🚀 PairCombine {self.VERSION} radar activating...")
 
@@ -79,9 +77,7 @@ class PairCombine:
 
         # Clean symbol names to match file prefixes
         clean_coin_list = [c.split('/')[0] + "USDT" if '/' in c else c.upper() for c in coin_list]
-        logger.info(f"🔍 Preparing to read data for following symbols: {clean_coin_list}")
 
-        # Format timeframe for Pandas
         pd_timeframe = f"{timeframe}min" if str(timeframe).isdigit() else timeframe
         pd_timeframe = pd_timeframe.lower().replace('m', 'min') if pd_timeframe.endswith('m') else pd_timeframe
 
@@ -94,7 +90,6 @@ class PairCombine:
             try:
                 df = pd.read_parquet(file_path)
 
-                # Fix datetime index issues
                 if not isinstance(df.index, pd.DatetimeIndex):
                     time_col = next((col for col in ['timestamp', 'time', 'date', 'ts'] if col in df.columns), None)
                     if time_col:
@@ -110,19 +105,16 @@ class PairCombine:
                         try:
                             df.index = pd.to_datetime(df.index)
                         except Exception:
-                            logger.warning(f"⚠️ No suitable time index found for {symbol}, skipping!")
                             continue
 
                 df = df.sort_index()
                 df.columns = [c.lower() for c in df.columns]
 
-                # Resample to target timeframe
                 df_resampled = df.resample(pd_timeframe).agg({
                     'o': 'first', 'h': 'max', 'l': 'min', 'c': 'last', 'v': 'sum'
                 }).dropna()
 
                 price_data[symbol] = df_resampled['c']
-                logger.debug(f"📦 Loaded: {symbol} (Total {len(df_resampled)} k-lines)")
 
             except Exception as e:
                 logger.error(f"⚠️ Error processing {symbol}: {e}")
@@ -139,31 +131,34 @@ class PairCombine:
             return None
 
         total_pairs = int(len(symbols) * (len(symbols) - 1) / 2)
-        logger.info(f"🔄 Starting calculation for {total_pairs} pairs...")
+        logger.info(f"🔄 Starting Log-OLS calculation for {total_pairs} pairs...")
 
-        # --- 3. Core Cointegration Calculation ---
+        # --- 3. Core Cointegration Calculation (LOG-TRANSFORMED) ---
         results = []
         scan_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
 
         for sym1, sym2 in combinations(symbols, 2):
-            y = df_prices[sym1]
-            x = df_prices[sym2]
+            raw_y = df_prices[sym1]
+            raw_x = df_prices[sym2]
 
-            correlation = y.corr(x)
-            # Skip low correlation pairs to save CPU resources
+            # Correlation using raw prices
+            correlation = raw_y.corr(raw_x)
             if correlation < 0.4:
                 continue
 
-            # Cointegration and OLS Regression
             try:
+                # 🎯 核心手術：將絕對價格轉為對數價格 (Natural Log)
+                y = np.log(raw_y)
+                x = np.log(raw_x)
+
                 score, p_value, _ = coint(y, x)
                 x_with_const = sm.add_constant(x)
                 ols_result = sm.OLS(y, x_with_const).fit()
 
                 alpha = float(ols_result.params.iloc[0])
-                beta = float(ols_result.params.iloc[1])
+                beta = float(ols_result.params.iloc[1])  # 這是全新的 Log-Beta！
 
-                # Calculate Spread = Y - (Beta * X + Alpha)
+                # Calculate Log Spread
                 spread = y - (beta * x + alpha)
                 half_life = self.calculate_half_life(spread)
 
@@ -179,13 +174,13 @@ class PairCombine:
                     's2': sym2,
                     'p_value': float(p_value),
                     'correlation': float(correlation),
-                    'beta': beta,
-                    'alpha': alpha,
+                    'beta': beta,  # 存入 Log-Beta
+                    'alpha': alpha,  # 存入 Log-Alpha
                     'half_life': float(half_life) if not np.isnan(half_life) else 9999.0,
                     'last_z_score': float(last_z_score),
                     'spread_std': float(spread_std),
-                    'last_p1': float(y.iloc[-1]),
-                    'last_p2': float(x.iloc[-1]),
+                    'last_p1': float(raw_y.iloc[-1]),  # 保持原始美金價格，方便閱讀
+                    'last_p2': float(raw_x.iloc[-1]),  # 保持原始美金價格，方便閱讀
                     'data_points': data_points
                 })
             except Exception as e:
@@ -199,7 +194,6 @@ class PairCombine:
         # --- 4. Data Formatting & CSV Export ---
         df_results = pd.DataFrame(results)
 
-        # Ranking by P-Value
         df_results = df_results.sort_values(by=['p_value']).reset_index(drop=True)
         df_results['rank'] = df_results.index + 1
         df_results['is_top_10'] = df_results['rank'] <= 10
@@ -212,9 +206,8 @@ class PairCombine:
         ]
         df_results = df_results[cols_order]
 
-        # Append to master_research_log.csv safely
         file_exists = log_filepath.exists()
         df_results.to_csv(log_filepath, mode='a', header=not file_exists, index=False)
-        logger.success(f"💾 Scan results successfully written to database: {log_filepath.name}")
+        logger.success(f"💾 Log-OLS Scan results successfully written: {log_filepath.name}")
 
         return df_results

@@ -22,11 +22,13 @@ except ImportError as e:
 
 class ExecutionManager:
     """
-    Industrial Grade Execution Engine v2.4.3-Stable
-    - ULTIMATE FIX: Bypass CCXT symbol parsing, use raw Bybit API 'info.symbol' for 100% perfect reconciliation match.
+    Industrial Grade Execution Engine v3.0.0-Stable
+    - ULTIMATE FIX: Log-Beta Neutral Position Sizing applied.
+    - Ensures Dollar-Neutrality across highly volatile asset pairs.
+    - Bypass CCXT symbol parsing, use raw Bybit API 'info.symbol' for 100% perfect reconciliation match.
     """
 
-    VERSION = "v2.4.3-Stable"
+    VERSION = "v3.0.0-Stable"
 
     def __init__(self, budget_per_pair=100.0):
         self.budget_per_pair = budget_per_pair
@@ -36,6 +38,7 @@ class ExecutionManager:
         self.vault_dir = self.root_dir / 'data' / 'vault'
         self.hwm_file = self.vault_dir / 'equity_hwm.json'
 
+        # 自動建立所需目錄
         self.trade_log.parent.mkdir(parents=True, exist_ok=True)
         self.signal_file.parent.mkdir(parents=True, exist_ok=True)
         self.vault_dir.mkdir(parents=True, exist_ok=True)
@@ -213,8 +216,7 @@ class ExecutionManager:
             positions = self._api_call_with_retry(self.exchange.fetch_positions, params={'category': 'linear'})
             if positions is None: return
 
-            # ✅ [SCO ULTIMATE FIX v2.4.3] 繞過 CCXT 解析，直接讀取 Bybit 原始的 'info' -> 'symbol'
-            # 這樣取得的字串會 100% 是 'BTCUSDT'，完美對應 CSV 內的格式
+            # ✅ 繞過 CCXT 解析，直接讀取 Bybit 原始的 'info' -> 'symbol'
             real_active_symbols = set()
             for p in positions:
                 if float(p.get('contracts', 0)) > 0:
@@ -372,20 +374,47 @@ class ExecutionManager:
             self._api_call_with_retry(self.exchange.create_order, sym2, 'market', close_side, q2)
         return False
 
+    # ==========================================
+    # 🎯 [v3.0 終極修復] Beta-Neutral 資金配平演算法
+    # ==========================================
     def _calculate_aligned_quantities(self, s1, s2, p1, p2, beta):
+        """
+        🚀 華爾街級 Beta-Neutral 資金配平演算法
+        利用 Log-Beta 計算等效波動資金，確保真正的市場中性。
+        """
         try:
-            qty1 = self.budget_per_pair / p1
-            qty2 = qty1 * abs(float(beta))
+            # 1. 計算基準資金 (S1 的目標投入美金)
+            target_value_1 = self.budget_per_pair
 
+            # 2. 計算對沖資金 (S2 的目標投入美金) = S1資金 * |Log-Beta|
+            # 這一步完美抵銷大盤單邊波動風險！
+            target_value_2 = target_value_1 * abs(float(beta))
+
+            # 3. 換算成真實代幣數量 (數量 = 投入美金 / 絕對價格)
+            raw_qty1 = target_value_1 / float(p1)
+            raw_qty2 = target_value_2 / float(p2)
+
+            # 4. 套用交易所精度限制
             sym1 = f"{s1.replace('USDT', '')}/USDT:USDT"
             sym2 = f"{s2.replace('USDT', '')}/USDT:USDT"
 
-            aq1 = float(self.exchange.amount_to_precision(sym1, qty1))
-            aq2 = float(self.exchange.amount_to_precision(sym2, qty2))
+            aq1 = float(self.exchange.amount_to_precision(sym1, raw_qty1))
+            aq2 = float(self.exchange.amount_to_precision(sym2, raw_qty2))
 
-            if (aq1 * p1 < 10.0) or (aq2 * p2 < 10.0): return None, None
+            # 防禦門檻：確保轉換精度後，雙邊價值不低於 10 USDT (交易所最小門檻)
+            if (aq1 * p1 < 10.0) or (aq2 * p2 < 10.0):
+                logger.warning(f"⚠️ {s1}-{s2} skipped: Notional value < 10 USDT after precision adjustment.")
+                return None, None
+
+            logger.info(f"⚖️ Beta-Neutral Sizing Computed:")
+            logger.info(f"   👉 {s1} Value: ${target_value_1:.2f} (Qty: {aq1})")
+            logger.info(f"   👉 {s2} Value: ${target_value_2:.2f} (Qty: {aq2})")
+            logger.info(f"   👉 Log-Beta Applied: {beta:.4f}")
+
             return aq1, aq2
-        except:
+
+        except Exception as e:
+            logger.error(f"❌ Failed to calculate aligned quantities: {e}")
             return None, None
 
     def _is_symbol_conflicted(self, s1, s2):
@@ -406,7 +435,7 @@ class ExecutionManager:
             'qty1': q1, 'qty2': q2, 'price1': p1, 'price2': p2,
             'beta': order['beta'],
             'opening_half_life': half_life,
-            'peak_z_score': 2.5,
+            'peak_z_score': order.get('z_score', 2.5),  # 動態讀取實際開倉 Z-Score
             'status': 'OPEN'
         }
         pd.DataFrame([log]).to_csv(self.trade_log, mode='a', index=False, header=not self.trade_log.exists())
