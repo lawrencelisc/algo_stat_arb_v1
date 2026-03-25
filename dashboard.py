@@ -10,7 +10,7 @@ from streamlit_autorefresh import st_autorefresh
 # ==========================================
 # 🛰️ 網頁配置與自定義 CSS
 # ==========================================
-VERSION = "v2.6.0-Stable"
+VERSION = "v2.5.8-Stable"
 
 st.set_page_config(
     page_title=f"Stat-Arb {VERSION} UI",
@@ -256,11 +256,11 @@ with tab2:
             df_plot['abs_z'] = df_plot['last_z_score'].abs()
             df_plot = df_plot.sort_values(by='abs_z', ascending=False).head(15)
 
-            # ✅ 升級 1：改為依據實際 Z-score 排序，形成對稱的發散圖
+            # 依據實際 Z-score 排序，形成對稱的發散圖
             df_plot = df_plot.sort_values(by='last_z_score', ascending=True)
 
 
-            # ✅ 升級 2：戰術級精準別類上色
+            # 戰術級精準別類上色
             def get_bar_color(z):
                 if z >= 2.0:
                     return '#ff4b4b'  # 鮮紅 (觸發做空)
@@ -274,17 +274,23 @@ with tab2:
 
             df_plot['bar_color'] = df_plot['last_z_score'].apply(get_bar_color)
 
-            # ✅ 升級 3：改為水平圖表 (Horizontal Bar Chart)
+            # ✅ 升級 1 & 2：精簡幣種名稱，並將 P-Value 與 Beta 嵌入 Y 軸標籤
+            df_plot['short_pair'] = df_plot['pair'].str.replace('USDT', '')
+            df_plot['pair_info'] = df_plot.apply(
+                lambda r: f"{r['short_pair']} (P:{r['p_value']:.4f} | β:{r['beta']:.4f})", axis=1
+            )
+
+            # 改為水平圖表 (Horizontal Bar Chart)
             fig = px.bar(
                 df_plot,
-                y='pair',
+                y='pair_info',  # ✅ 使用新生成的富資訊標籤
                 x='last_z_score',
-                orientation='h',  # 水平顯示
-                text='last_z_score',  # 直接顯示數字
+                orientation='h',
+                text='last_z_score',
                 color='bar_color',
-                color_discrete_map="identity",  # 確保使用我們自訂的 Hex 色碼
+                color_discrete_map="identity",
                 hover_data=['p_value', 'half_life'] if 'half_life' in df_plot.columns else ['p_value'],
-                title="Top 15 Deviated Pairs (Diverging Radar)"
+                title="Top 15 Deviated Pairs (Radar)"
             )
 
             # 調整數字顯示位置與格式
@@ -294,14 +300,14 @@ with tab2:
 
             # 動態延伸 X 軸，確保數字標籤不會被邊界切掉
             max_abs_z = df_plot['abs_z'].max()
-            x_range = max(4.0, max_abs_z + 0.5)
+            x_range = max(4.0, max_abs_z + 0.6)
 
             fig.update_layout(
                 xaxis_title="Current Z-Score",
                 yaxis_title="",
                 xaxis=dict(range=[-x_range, x_range]),
                 margin=dict(l=20, r=40, t=40, b=20),
-                height=480,
+                height=380,  # ✅ 升級 3：將高度從 480 縮小到 380，讓圖表更緊湊
                 showlegend=False
             )
             st.plotly_chart(fig, use_container_width=True)
@@ -327,7 +333,7 @@ with tab2:
             fig_gauge.update_layout(height=350, margin=dict(l=20, r=20, t=40, b=20))
             st.plotly_chart(fig_gauge, use_container_width=True)
 
-            # ✅ 新增 Thermostat (Gauge) 圖例 (Legend)
+            # Thermostat (Gauge) 圖例 (Legend)
             st.markdown("""
                 <div style="display: flex; justify-content: center; gap: 15px; font-size: 0.85rem; color: #a0a0a0; margin-top: -20px; margin-bottom: 20px;">
                     <div style="display: flex; align-items: center;">
