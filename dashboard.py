@@ -10,7 +10,7 @@ from streamlit_autorefresh import st_autorefresh
 # ==========================================
 # 🛰️ 網頁配置與自定義 CSS
 # ==========================================
-VERSION = "v2.5.9-Stable"
+VERSION = "v2.6.4-Stable"
 
 st.set_page_config(
     page_title=f"Stat-Arb {VERSION} UI",
@@ -251,15 +251,6 @@ with tab2:
         if not df_log.empty:
             st.markdown("##### 🎯 Top 15 Deviated Pairs (Entry Radar)")
 
-            # ✅ 新增：醒目的戰術開倉條件面板
-            st.info("""
-            **💡 統計套利標準開倉條件 (Entry Criteria)：**
-            * **P-Value (共整合強度)**：必須 `< 0.05` （越小越好，超過 0.05 代表走勢脫鉤，不能做）。
-            * **Z-Score (偏離度)**：絕對值必須 `>= 2.0`。
-              * 🔴 `>= 2.0`：做空第一隻幣 / 做多第二隻幣 (Short 1 / Long 2)
-              * 🟢 `<= -2.0`：做多第一隻幣 / 做空第二隻幣 (Long 1 / Short 2)
-            """)
-
             latest_ts = df_log['timestamp'].max()
             df_plot = df_log[df_log['timestamp'] == latest_ts].copy()
 
@@ -321,6 +312,20 @@ with tab2:
                          .map(style_signal, subset=['Signal Status']))
 
             st.dataframe(styled_df, use_container_width=True, hide_index=True, height=430)
+
+            # ✅ 搬到表格下方，翻譯為英文，縮小字體並匹配背景設計
+            st.markdown("""
+                <div style="background-color: #1e2130; border: 1px solid #3e4259; padding: 12px 18px; font-size: 0.8rem; color: #94a3b8; border-radius: 8px; margin-top: 10px;">
+                    <span style="color: #e2e8f0; font-weight: bold; font-size: 0.85rem;">💡 Entry Criteria:</span><br>
+                    <div style="margin-top: 4px;">
+                        <span style="margin-left: 5px;">• <b>P-Value (Cointegration Strength):</b> Must be <code>< 0.05</code> (Smaller is better; > 0.05 indicates decoupling, do not trade).</span><br>
+                        <span style="margin-left: 5px;">• <b>Z-Score (Deviation):</b> Absolute value must be <code>>= 2.0</code>.</span><br>
+                        <span style="margin-left: 20px;">🔴 <code>>= 2.0</code> : Short 1st Coin / Long 2nd Coin</span><br>
+                        <span style="margin-left: 20px;">🟢 <code><= -2.0</code>: Long 1st Coin / Short 2nd Coin</span>
+                    </div>
+                </div>
+            """, unsafe_allow_html=True)
+
         else:
             st.info("No scan data available.")
 
