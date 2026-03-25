@@ -10,7 +10,7 @@ from streamlit_autorefresh import st_autorefresh
 # ==========================================
 # 🛰️ 網頁配置與自定義 CSS
 # ==========================================
-VERSION = "v2.5.8-Stable"
+VERSION = "v2.5.9-Stable"
 
 st.set_page_config(
     page_title=f"Stat-Arb {VERSION} UI",
@@ -243,12 +243,23 @@ with tab1:
     else:
         st.success("✨ All clear! Scanning for new opportunities...")
 
-# --- Tab 2: 實時雷達圖 (終極視覺升級) ---
+# --- Tab 2: 實時雷達圖 (改為戰術掃描表格) ---
 with tab2:
-    col_radar, col_gauge = st.columns([3, 1])
+    col_table, col_gauge = st.columns([3, 1])
 
-    with col_radar:
+    with col_table:
         if not df_log.empty:
+            st.markdown("##### 🎯 Top 15 Deviated Pairs (Entry Radar)")
+
+            # ✅ 新增：醒目的戰術開倉條件面板
+            st.info("""
+            **💡 統計套利標準開倉條件 (Entry Criteria)：**
+            * **P-Value (共整合強度)**：必須 `< 0.05` （越小越好，超過 0.05 代表走勢脫鉤，不能做）。
+            * **Z-Score (偏離度)**：絕對值必須 `>= 2.0`。
+              * 🔴 `>= 2.0`：做空第一隻幣 / 做多第二隻幣 (Short 1 / Long 2)
+              * 🟢 `<= -2.0`：做多第一隻幣 / 做空第二隻幣 (Long 1 / Short 2)
+            """)
+
             latest_ts = df_log['timestamp'].max()
             df_plot = df_log[df_log['timestamp'] == latest_ts].copy()
 
@@ -256,61 +267,60 @@ with tab2:
             df_plot['abs_z'] = df_plot['last_z_score'].abs()
             df_plot = df_plot.sort_values(by='abs_z', ascending=False).head(15)
 
-            # 依據實際 Z-score 排序，形成對稱的發散圖
-            df_plot = df_plot.sort_values(by='last_z_score', ascending=True)
+            # 準備乾淨的表格數據
+            df_plot['Pair'] = df_plot['pair'].str.replace('USDT', '')
+            df_plot['Z-Score'] = df_plot['last_z_score'].apply(float)
+            df_plot['P-Value'] = df_plot['p_value'].apply(float)
+            df_plot['Beta'] = df_plot['beta'].apply(float)
 
 
-            # 戰術級精準別類上色
-            def get_bar_color(z):
+            # 🎯 核心判定邏輯：即時給出這對組合目前的狀態信號
+            def get_status(row):
+                z = row['Z-Score']
+                p = row['P-Value']
+                if p >= 0.05:
+                    return "⚠️ Weak Cointegration (P>0.05)"
                 if z >= 2.0:
-                    return '#ff4b4b'  # 鮮紅 (觸發做空)
-                elif z <= -2.0:
-                    return '#00ff00'  # 鮮綠 (觸發做多)
-                elif z > 0:
-                    return '#8b3a3a'  # 暗紅 (未達標)
-                else:
-                    return '#2e8b57'  # 暗綠 (未達標)
+                    return "🔴 Short 1 / Long 2"
+                if z <= -2.0:
+                    return "🟢 Long 1 / Short 2"
+                return "⏳ Wait for Divergence"
 
 
-            df_plot['bar_color'] = df_plot['last_z_score'].apply(get_bar_color)
+            df_plot['Signal Status'] = df_plot.apply(get_status, axis=1)
 
-            # ✅ 升級 1 & 2：精簡幣種名稱，並將 P-Value 與 Beta 嵌入 Y 軸標籤
-            df_plot['short_pair'] = df_plot['pair'].str.replace('USDT', '')
-            df_plot['pair_info'] = df_plot.apply(
-                lambda r: f"{r['short_pair']} (P:{r['p_value']:.4f} | β:{r['beta']:.4f})", axis=1
-            )
+            # 挑選要顯示的欄位
+            show_df = df_plot[['Pair', 'Z-Score', 'P-Value', 'Beta', 'Signal Status']].copy()
 
-            # 改為水平圖表 (Horizontal Bar Chart)
-            fig = px.bar(
-                df_plot,
-                y='pair_info',  # ✅ 使用新生成的富資訊標籤
-                x='last_z_score',
-                orientation='h',
-                text='last_z_score',
-                color='bar_color',
-                color_discrete_map="identity",
-                hover_data=['p_value', 'half_life'] if 'half_life' in df_plot.columns else ['p_value'],
-                title="Top 15 Deviated Pairs (Radar)"
-            )
+            # 格式化小數點
+            format_dict = {'Z-Score': '{:.2f}', 'P-Value': '{:.4f}', 'Beta': '{:.4f}'}
 
-            # 調整數字顯示位置與格式
-            fig.update_traces(texttemplate='%{text:.2f}', textposition='outside')
-            fig.add_vline(x=2.0, line_dash="dash", line_color="#ff4b4b")
-            fig.add_vline(x=-2.0, line_dash="dash", line_color="#00ff00")
 
-            # 動態延伸 X 軸，確保數字標籤不會被邊界切掉
-            max_abs_z = df_plot['abs_z'].max()
-            x_range = max(4.0, max_abs_z + 0.6)
+            # 顏色渲染邏輯
+            def style_z(val):
+                color = '#ff4b4b' if val >= 2.0 else '#00ff00' if val <= -2.0 else 'white'
+                return f'color: {color}; font-weight: bold;'
 
-            fig.update_layout(
-                xaxis_title="Current Z-Score",
-                yaxis_title="",
-                xaxis=dict(range=[-x_range, x_range]),
-                margin=dict(l=20, r=40, t=40, b=20),
-                height=380,  # ✅ 升級 3：將高度從 480 縮小到 380，讓圖表更緊湊
-                showlegend=False
-            )
-            st.plotly_chart(fig, use_container_width=True)
+
+            def style_p(val):
+                color = 'lightgreen' if val < 0.01 else 'yellow' if val < 0.05 else 'salmon'
+                return f'color: {color}; font-weight: bold;'
+
+
+            def style_signal(val):
+                if 'Short 1' in val: return 'color: #ff4b4b; font-weight: bold;'
+                if 'Long 1' in val: return 'color: #00ff00; font-weight: bold;'
+                if 'Weak' in val: return 'color: salmon;'
+                return 'color: #a0a0a0;'  # 灰色代表等待
+
+
+            styled_df = (show_df.style
+                         .format(format_dict)
+                         .map(style_z, subset=['Z-Score'])
+                         .map(style_p, subset=['P-Value'])
+                         .map(style_signal, subset=['Signal Status']))
+
+            st.dataframe(styled_df, use_container_width=True, hide_index=True, height=430)
         else:
             st.info("No scan data available.")
 
@@ -346,7 +356,7 @@ with tab2:
                     </div>
                     <div style="display: flex; align-items: center;">
                         <span style="display: inline-block; width: 12px; height: 12px; background-color: salmon; border-radius: 50%; margin-right: 5px;"></span>
-                        Warning
+                        Warning (>0.05)
                     </div>
                 </div>
             """, unsafe_allow_html=True)
