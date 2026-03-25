@@ -10,7 +10,7 @@ from streamlit_autorefresh import st_autorefresh
 # ==========================================
 # 🛰️ 網頁配置與自定義 CSS
 # ==========================================
-VERSION = "v2.5.6-Stable"
+VERSION = "v2.6.0-Stable"
 
 st.set_page_config(
     page_title=f"Stat-Arb {VERSION} UI",
@@ -51,7 +51,7 @@ TRADE_PATH = ROOT / 'data' / 'trade' / 'trade_record.csv'
 # ==========================================
 # 📥 數據載入與預處理 (Read Only)
 # ==========================================
-@st.cache_data(ttl=50)  # 快取 50 秒，避免頻繁讀檔 CSV
+@st.cache_data(ttl=50)
 def load_data():
     df_log = pd.read_csv(LOG_PATH) if LOG_PATH.exists() else pd.DataFrame()
     df_trade = pd.read_csv(TRADE_PATH) if TRADE_PATH.exists() else pd.DataFrame()
@@ -64,13 +64,11 @@ def load_data():
     return df_log, df_trade
 
 
-# 📡 實時價格抓取 (Public API，無需 Key，安全免干擾)
-@st.cache_data(ttl=15)  # 每 15 秒才准許抓一次 API，防止被 Ban
+@st.cache_data(ttl=15)
 def fetch_live_prices(symbols):
     if not symbols: return {}
     try:
         exchange = ccxt.bybit({'options': {'defaultType': 'linear'}})
-        # 轉換成 CCXT 的 Bybit 永續合約格式 (例: BTCUSDT -> BTC/USDT:USDT)
         ccxt_symbols = [f"{s.replace('USDT', '')}/USDT:USDT" for s in symbols]
         tickers = exchange.fetch_tickers(ccxt_symbols)
         prices = {}
@@ -89,14 +87,12 @@ active_df = pd.DataFrame()
 if not df_trade.empty:
     active_df = df_trade[df_trade['status'] == 'OPEN']
 
-# 取得最新 Z-Score 用於計算方向與映射
 z_map = {}
 if not df_log.empty:
     latest_ts = df_log['timestamp'].max()
     latest_scan = df_log[df_log['timestamp'] == latest_ts]
     z_map = latest_scan.set_index('pair')['last_z_score'].to_dict()
 
-# 💰 實時未實現盈虧 (Live PnL) 結算邏輯
 total_floating_pnl = 0.0
 display_df = active_df.copy() if not active_df.empty else pd.DataFrame()
 
@@ -107,12 +103,9 @@ if not display_df.empty:
 
     live_pnl_list = []
     time_left_list = []
-
-    # 計算當前 UTC 時間以比對 Time-Exit
     current_utc_time = pd.Timestamp.utcnow()
 
     for idx, row in display_df.iterrows():
-        # --- 1. 計算 Live PnL ---
         try:
             z_val = row['Current Z']
             if pd.isna(z_val):
@@ -126,7 +119,6 @@ if not display_df.empty:
                     ep1, ep2 = float(row['price1']), float(row['price2'])
                     q1, q2 = float(row['qty1']), float(row['qty2'])
 
-                    # 透過 Z-Score 正負號判斷多空方向 (Z>0: Short s1/Long s2, Z<0: Long s1/Short s2)
                     if z_val > 0:
                         pnl = (ep1 - cp1) * q1 + (cp2 - ep2) * q2
                     else:
@@ -139,18 +131,14 @@ if not display_df.empty:
         except Exception:
             live_pnl_list.append(None)
 
-        # --- 2. 計算 Time-Exit 剩餘時間 ---
         try:
-            # 確保 entry_time 具備時區資訊 (UTC)
             entry_t = pd.Timestamp(row['entry_time'])
             if entry_t.tz is None:
                 entry_t = entry_t.tz_localize('UTC')
 
-            # 獲取半衰期，預設 8.0 小時
             hl = float(row.get('opening_half_life', 8.0))
             if pd.isna(hl): hl = 8.0
 
-            # 閾值：3倍半衰期
             time_limit_hours = hl * 3
             deadline = entry_t + pd.Timedelta(hours=time_limit_hours)
             remaining_time = deadline - current_utc_time
@@ -178,9 +166,6 @@ with col_title:
 with col_time:
     st.write(f"⏱️ `Last Sync: {datetime.now().strftime('%H:%M:%S')}`")
 
-# ==========================================
-# 📊 第一層：數據指標 (Metrics)
-# ==========================================
 m1, m2, m3, m4 = st.columns(4)
 
 with m1:
@@ -207,10 +192,9 @@ with m4:
 # ==========================================
 tab1, tab2, tab3 = st.tabs(["🔥 Active Positions", "🎯 Real-time Radar", "📜 Historical Logs"])
 
-# --- Tab 1: 活躍持倉 (強化版) ---
+# --- Tab 1: 活躍持倉 ---
 with tab1:
     if not display_df.empty:
-        # 整理顯示欄位格式
         display_df['entry_time'] = display_df['entry_time'].dt.strftime('%m-%d %H:%M')
         display_df['peak_z_score'] = display_df['peak_z_score'].apply(
             lambda x: f"{float(x):.2f}" if pd.notna(x) else "N/A")
@@ -220,11 +204,9 @@ with tab1:
         display_df['price2'] = display_df['price2'].apply(lambda x: f"{float(x):.4f}" if pd.notna(x) else "N/A")
         display_df['beta'] = display_df['beta'].apply(lambda x: f"{float(x):.6f}" if pd.notna(x) else "N/A")
 
-        # ✅ 新增 Time Left 顯示
         cols = ['entry_time', 'pair', 'Time Left', 'peak_z_score', 'Current Z', 'Live PnL', 'price1', 'price2', 'beta']
 
 
-        # 色彩映射函數
         def color_z_score(val):
             try:
                 v = float(val)
@@ -251,7 +233,6 @@ with tab1:
             return ''
 
 
-        # 三重上色：Z-Score, Live PnL, Time Left 都有專屬顏色提示
         styled_df = (display_df[cols].style
                      .map(color_z_score, subset=['Current Z'])
                      .map(color_pnl, subset=['Live PnL'])
@@ -262,7 +243,7 @@ with tab1:
     else:
         st.success("✨ All clear! Scanning for new opportunities...")
 
-# --- Tab 2: 實時雷達圖 ---
+# --- Tab 2: 實時雷達圖 (終極視覺升級) ---
 with tab2:
     col_radar, col_gauge = st.columns([3, 1])
 
@@ -270,19 +251,59 @@ with tab2:
         if not df_log.empty:
             latest_ts = df_log['timestamp'].max()
             df_plot = df_log[df_log['timestamp'] == latest_ts].copy()
+
+            # 取絕對值偏離最大的前 15 名
             df_plot['abs_z'] = df_plot['last_z_score'].abs()
             df_plot = df_plot.sort_values(by='abs_z', ascending=False).head(15)
 
+            # ✅ 升級 1：改為依據實際 Z-score 排序，形成對稱的發散圖
+            df_plot = df_plot.sort_values(by='last_z_score', ascending=True)
+
+
+            # ✅ 升級 2：戰術級精準別類上色
+            def get_bar_color(z):
+                if z >= 2.0:
+                    return '#ff4b4b'  # 鮮紅 (觸發做空)
+                elif z <= -2.0:
+                    return '#00ff00'  # 鮮綠 (觸發做多)
+                elif z > 0:
+                    return '#8b3a3a'  # 暗紅 (未達標)
+                else:
+                    return '#2e8b57'  # 暗綠 (未達標)
+
+
+            df_plot['bar_color'] = df_plot['last_z_score'].apply(get_bar_color)
+
+            # ✅ 升級 3：改為水平圖表 (Horizontal Bar Chart)
             fig = px.bar(
-                df_plot, x='pair', y='last_z_score',
-                color='last_z_score',
-                color_continuous_scale='RdYlGn_r',
-                range_y=[-4, 4],
-                title="Top 15 Deviated Pairs"
+                df_plot,
+                y='pair',
+                x='last_z_score',
+                orientation='h',  # 水平顯示
+                text='last_z_score',  # 直接顯示數字
+                color='bar_color',
+                color_discrete_map="identity",  # 確保使用我們自訂的 Hex 色碼
+                hover_data=['p_value', 'half_life'] if 'half_life' in df_plot.columns else ['p_value'],
+                title="Top 15 Deviated Pairs (Diverging Radar)"
             )
-            fig.add_hline(y=2.0, line_dash="dash", line_color="#ff4b4b")
-            fig.add_hline(y=-2.0, line_dash="dash", line_color="#00ff00")
-            fig.update_layout(margin=dict(l=20, r=20, t=40, b=20), height=350)
+
+            # 調整數字顯示位置與格式
+            fig.update_traces(texttemplate='%{text:.2f}', textposition='outside')
+            fig.add_vline(x=2.0, line_dash="dash", line_color="#ff4b4b")
+            fig.add_vline(x=-2.0, line_dash="dash", line_color="#00ff00")
+
+            # 動態延伸 X 軸，確保數字標籤不會被邊界切掉
+            max_abs_z = df_plot['abs_z'].max()
+            x_range = max(4.0, max_abs_z + 0.5)
+
+            fig.update_layout(
+                xaxis_title="Current Z-Score",
+                yaxis_title="",
+                xaxis=dict(range=[-x_range, x_range]),
+                margin=dict(l=20, r=40, t=40, b=20),
+                height=480,
+                showlegend=False
+            )
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("No scan data available.")
@@ -306,19 +327,35 @@ with tab2:
             fig_gauge.update_layout(height=350, margin=dict(l=20, r=20, t=40, b=20))
             st.plotly_chart(fig_gauge, use_container_width=True)
 
+            # ✅ 新增 Thermostat (Gauge) 圖例 (Legend)
+            st.markdown("""
+                <div style="display: flex; justify-content: center; gap: 15px; font-size: 0.85rem; color: #a0a0a0; margin-top: -20px; margin-bottom: 20px;">
+                    <div style="display: flex; align-items: center;">
+                        <span style="display: inline-block; width: 12px; height: 12px; background-color: lightgreen; border-radius: 50%; margin-right: 5px;"></span>
+                        Excellent (<0.01)
+                    </div>
+                    <div style="display: flex; align-items: center;">
+                        <span style="display: inline-block; width: 12px; height: 12px; background-color: yellow; border-radius: 50%; margin-right: 5px;"></span>
+                        Good (<0.05)
+                    </div>
+                    <div style="display: flex; align-items: center;">
+                        <span style="display: inline-block; width: 12px; height: 12px; background-color: salmon; border-radius: 50%; margin-right: 5px;"></span>
+                        Warning
+                    </div>
+                </div>
+            """, unsafe_allow_html=True)
+
 # --- Tab 3: 歷史紀錄與盈虧圖 ---
 with tab3:
     if not df_trade.empty:
         closed_df = df_trade[df_trade['status'] != 'OPEN'].copy()
 
         if not closed_df.empty and 'pnl' in closed_df.columns:
-            # 繪製累積盈虧圖
             closed_df['Cumulative PnL'] = closed_df['pnl'].cumsum()
             fig_pnl = px.line(closed_df, x='entry_time', y='Cumulative PnL', title="Cumulative PnL Curve", markers=True)
             fig_pnl.update_layout(height=300, margin=dict(l=20, r=20, t=40, b=20))
             st.plotly_chart(fig_pnl, use_container_width=True)
 
-        # 顯示歷史表格
         st.subheader("Trade History")
         display_closed = closed_df.tail(20).sort_values(by='entry_time', ascending=False)
         st.dataframe(display_closed, use_container_width=True, hide_index=True)
