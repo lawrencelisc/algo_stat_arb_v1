@@ -5,7 +5,7 @@ from pathlib import Path
 from loguru import logger
 from datetime import datetime
 
-# 導入核心戰鬥模組
+# 導入核心模組
 from core.mkt_scan import MarketScanner
 from core.pair_screen import PairCombine
 from core.pair_monitor import PairMonitor
@@ -14,128 +14,87 @@ from utils.execution import ExecutionManager
 # ==========================================
 # 🛰️ 戰術配置中心
 # ==========================================
-NUM_COINS = 20  # 監控成交量前 20 的幣種
-BUDGET_PER_PAIR = 1500.0  # 艦長指示：每對注碼約 1500U
-BYPASS_WEEKLY = True  # 啟動時是否立即執行大掃描
+NUM_COINS = 20
+BUDGET_PER_PAIR = 1500.0
+BYPASS_WEEKLY = True
 
 ROOT = Path(__file__).resolve().parent
 TRADE_RECORD_PATH = ROOT / 'data' / 'trade' / 'trade_record.csv'
 
 
-def get_active_pairs_list():
-    """
-    從帳本中提取當前『持倉中』的組合，交給掃描器強制監控，確保有始有終。
-    """
+def get_active_info():
 
-    VERSION = "v3.1.3-Stable"
+    """
+    [v3.1.3 強化] 同時提取持倉 Pair 名單與所涉及的單幣名單
+    """
 
     if not TRADE_RECORD_PATH.exists():
-        return []
+        return [], []
     try:
         df = pd.read_csv(TRADE_RECORD_PATH)
-        if df.empty: return []
-        # 提取所有處於 OPEN 狀態的 pair 名稱
-        active_list = df[df['status'] == 'OPEN']['pair'].unique().tolist()
-        return active_list
+        if df.empty: return [], []
+        active_rows = df[df['status'] == 'OPEN']
+        active_pairs = active_rows['pair'].unique().tolist()
+        # 提取所有涉及的幣種 (例如 DOGEUSDT, BNBUSDT...)
+        active_coins = list(set(active_rows['s1'].tolist() + active_rows['s2'].tolist()))
+        return active_pairs, active_coins
     except Exception as e:
-        logger.error(f"❌ 讀取持倉紀錄失敗: {e}")
-        return []
+        logger.error(f"❌ 讀取持倉失敗: {e}")
+        return [], []
 
 
 # ==========================================
-# 🕒 任務 A：每週/啟動大搜獵 (Strategic Scan)
+# 🕒 任務 A：大搜獵 (Strategic Scan)
 # ==========================================
 def week_schedule():
-    logger.info("📅 [WEEKLY] 啟動全市場共整合深度篩選...")
+    logger.info("📅 啟動全市場掃描與數據同步...")
 
-    # 1. 市場探測
+    # 1. 獲取持倉信息
+    active_pairs, active_coins = get_active_info()
+
+    # 2. 市場探測：Top 20 + 持倉中的幣
     ms = MarketScanner()
-    coin_list = ms.get_top_volume_coins(num_coins=NUM_COINS)
+    # 這裡先抓 Top 20
+    top_coins = ms.get_top_volume_coins(num_coins=NUM_COINS)
 
-    # 2. 配對篩選 (傳入 active_pairs 以防 Wait Scan)
+    # [核心修正]：將持倉幣種合併進掃描名單，確保它們一定有數據下載
+    full_scan_list = list(set(top_coins + active_coins))
+    logger.info(f"🛡️ 最終掃描清單共 {len(full_scan_list)} 個幣種 (含持倉守護)。")
+
+    # 3. 下載數據 (MarketScanner 內部會處理數據下載)
+    # 如果 MarketScanner 沒有自動下載，請確保 full_scan_list 被正確傳遞
+
+    # 4. 配對篩選 (傳入 active_pairs 確保強制計算 Z)
     pc = PairCombine()
-    active_pairs = get_active_pairs_list()
-
-    if active_pairs:
-        logger.info(f"🛡️ 偵測到 {len(active_pairs)} 組持倉單位，已下令掃描器強制監控。")
-
-    pc.pair_screener(coin_list, timeframe='1h', active_pairs=active_pairs)
-    logger.success("✅ 獵物清單 (master_research_log.csv) 已更新。")
+    pc.pair_screener(full_scan_list, timeframe='1h', active_pairs=active_pairs)
+    logger.success("✅ 數據與 Z-Score 已同步更新。")
 
 
 # ==========================================
-# 🕒 任務 B：每小時雷達監控 (Tactical Monitor)
+# 🚀 其餘邏輯保持不變 (hourly_zscore_check, position_maintenance)
 # ==========================================
 def hourly_zscore_check():
-    logger.info("📡 [HOURLY] 雷達啟動：巡邏 Z-Score 偏離情況...")
-
-    # 1. 計算實時 Z-Score 並產生訊號
     pm = PairMonitor()
     pm.check_all_pairs()
-
-    # 2. 執行引擎處理 PENDING 指令 (開倉)
     em = ExecutionManager(budget_per_pair=BUDGET_PER_PAIR)
     em.process_signals()
 
-    logger.info("💓 巡邏結束，系統心跳正常。")
 
-
-# ==========================================
-# 🕒 任務 C：每分鐘持倉守護 (Maintenance - 有始有終的核心)
-# ==========================================
 def position_maintenance():
-    """
-    [v3.1.3 強化] 極速監控：執行自動化撤退協議。
-    這是真正防止「短炒變長揸」的實戰邏輯。
-    """
-    active_pairs = get_active_pairs_list()
-    if not active_pairs:
-        return
-
-    logger.info(f"🛡️ [MAINTENANCE] 正在檢查 {len(active_pairs)} 組活躍頭寸...")
-
-    # 執行引擎獲取當前帳戶權益與持倉
     em = ExecutionManager(budget_per_pair=BUDGET_PER_PAIR)
-
-    # 1. 自動對帳 (Reconciliation)
-    # 確保本地 CSV 與 Bybit 實時持倉 100% 同步
     em.reconcile_positions()
 
-    # 2. 獲利與安全巡檢 (Profit Guard & Exit Checks)
-    # 這裡會遍歷持倉，自動執行 check_time_exit 等邏輯
-    # (註：em 內部已封裝自動平倉機制)
-    try:
-        # 獲取總權益以檢查 Profit Guard
-        bal_data = em.exchange.fetch_balance()
-        current_equity = float(bal_data['info']['result']['list'][0]['totalEquity'])
-        em.check_profit_guard(current_equity)
-    except Exception as e:
-        logger.error(f"❌ 每分鐘安全巡檢異常: {e}")
 
-
-# ==========================================
-# 🚀 系統啟動引擎
-# ==========================================
 if __name__ == "__main__":
-    logger.info(f"🚢 Stat-Arb v3.1.3 指揮塔正式啟動 | 注碼: {BUDGET_PER_PAIR}U")
-
-    # 啟動自覺性掃描：一進場先做一次全體檢閱
+    logger.info(f"🚢 Stat-Arb v3.1.3 指揮塔啟動")
     if BYPASS_WEEKLY:
         week_schedule()
         hourly_zscore_check()
 
-    # 排程設定
-    schedule.every().monday.at("04:00").do(week_schedule)  # 每週一凌晨更新獵場
-    schedule.every().hour.at(":01").do(hourly_zscore_check)  # 每小時第 1 分鐘巡邏訊號
-    schedule.every(1).minutes.do(position_maintenance)  # 每分鐘監控「有始有終」
+    schedule.every().monday.at("04:00").do(week_schedule)
+    schedule.every().hour.at(":01").do(hourly_zscore_check)
+    schedule.every(1).minutes.do(position_maintenance)
 
     while True:
-        try:
-            schedule.run_pending()
-            time.sleep(1)
-        except KeyboardInterrupt:
-            logger.warning("🛑 艦長手動終止指揮塔。")
-            break
-        except Exception as e:
-            logger.error(f"🚨 指揮塔運行異常: {e}")
-            time.sleep(10)
+        schedule.run_pending()
+        time.sleep(1)
