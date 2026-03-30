@@ -17,7 +17,7 @@ from utils.execution import ExecutionManager
 # 🛰️ 戰術配置中心
 # ==========================================
 NUM_COINS = 24  # 掃描前 24 名流動性幣種
-BUDGET_PER_PAIR = 1500.0  # 每個配對的預算
+BUDGET_PER_PAIR = 150.0  # 每個配對的預算
 RUN_INTERVAL_MINS = 5  # 核心修正：每 5 分鐘運行一次
 
 ROOT = Path(__file__).resolve().parent

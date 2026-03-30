@@ -10,114 +10,65 @@ from loguru import logger
 
 class PairCombine:
     """
-    [STAGE 2] Pair Screener Module
-    Location: /core/pair_screen.py
-    Responsibility: Log-price transformation, Cointegration testing (EG Test),
-                    calculating Beta, Half-life, and restoring dashboard fields.
-    Optimized: Handles index alignment to prevent "Empty Matrix" errors.
+    [大腦] Pair Screener: 嚴格篩選同向、共整合的配對
     """
-    VERSION = "v3.2.6-Safety"
+    VERSION = "v4.0.0-FirstPrinciples"
 
     def __init__(self):
-        # 路徑定義
         self.root_dir = Path(__file__).resolve().parent.parent
         self.data_dir = self.root_dir / 'data' / 'rawdata'
         self.result_folder = self.root_dir / 'result'
         self.log_filepath = self.result_folder / 'master_research_log.csv'
-
-        # 確保結果目錄存在
         self.result_folder.mkdir(parents=True, exist_ok=True)
-        logger.info(f'🛰️ PairCombine {self.VERSION} initialized.')
 
     def calculate_half_life(self, spread):
-        """
-        計算殘差回歸的半衰期 (Mean Reversion Speed)
-        """
         spread = spread.dropna()
-        if len(spread) <= 1:
-            return 9999.0
-
+        if len(spread) <= 1: return 9999.0
         spread_lag = spread.shift(1)
         spread_ret = spread - spread_lag
-
-        # 移除空值以進行回歸
         valid_idx = spread_ret.index[1:]
         y = spread_ret.loc[valid_idx]
         x = sm.add_constant(spread_lag.loc[valid_idx])
-
         try:
-            model = sm.OLS(y, x)
-            res = model.fit()
+            res = sm.OLS(y, x).fit()
             theta = res.params.iloc[1]
-            if theta >= 0:
-                return 9999.0  # 不具備回歸特性
-            half_life = -np.log(2) / theta
-            return half_life
-        except Exception:
+            return -np.log(2) / theta if theta < 0 else 9999.0
+        except:
             return 9999.0
 
     def load_log_prices(self, symbol_list, timeframe='1h'):
-        """
-        載入 Parquet 並使用 concat 確保對齊。
-        [終極優化]：完全捨棄全局 dropna()，容許 NaN 存在，交由兩兩配對時獨立處理。
-        """
+        """載入數據並對齊時間軸"""
         series_dict = {}
         for sym in symbol_list:
-            # 搜尋對應的 Parquet 檔案
             files = list(self.data_dir.glob(f"{sym}_{timeframe}_*.parquet"))
-            if not files:
-                continue
-
-            # 讀取最新的數據檔案
+            if not files: continue
             latest_file = max(files, key=lambda x: x.stat().st_mtime)
             try:
                 df = pd.read_parquet(latest_file)
                 if df.empty: continue
-
-                # 確保 index 是時間格式以便對齊
                 if not isinstance(df.index, pd.DatetimeIndex):
                     df.index = pd.to_datetime(df.index)
-
-                # [核心] 應用對數價格轉化 (Log-Price)
-                df = df.sort_index()
-                series_dict[sym] = np.log(df['c'])
+                series_dict[sym] = np.log(df.sort_index()['c'])
             except Exception as e:
-                logger.error(f"❌ Failed to load {sym}: {e}")
+                logger.error(f"Failed to load {sym}: {e}")
 
-        if not series_dict:
-            return pd.DataFrame()
-
-        # [完美修復邏輯] 使用 concat axis=1 進行 index 對齊，僅作輕微向前填充
-        # ⚠️ 絕對不在這裡執行 .dropna()，這會讓新幣種的缺失歷史毀掉所有其他幣種！
-        final_df = pd.concat(series_dict, axis=1).sort_index()
-        final_df = final_df.ffill(limit=3)
-
-        return final_df
+        if not series_dict: return pd.DataFrame()
+        # concat 後 ffill 填補微小空缺，確保矩陣穩健
+        return pd.concat(series_dict, axis=1).sort_index().ffill(limit=3)
 
     def pair_screener(self, symbol_list, timeframe='1h', active_pairs=None):
-        """
-        核心篩選邏輯：遍歷所有組合並強制計算持倉配對
-        """
-        logger.info(f"🔍 Starting co-integration scan for {len(symbol_list)} symbols...")
+        logger.info(f"🧠 系統重置：開始嚴格共整合篩選 ({len(symbol_list)} symbols)")
         active_pairs = active_pairs or []
-
-        # 1. 載入並對齊對數價格矩陣 (此時矩陣內允許包含 NaN)
         price_matrix = self.load_log_prices(symbol_list, timeframe)
-        if price_matrix.empty:
-            logger.warning("⚠️ Price matrix is empty. Research log will not be updated.")
-            return
+        if price_matrix.empty: return
 
-        # 2. 生成所有可能的配對組合
         all_combos = list(combinations(price_matrix.columns, 2))
-
-        # 確保持倉中的配對即便不在 Top List 也會被加入掃描
         for ap in active_pairs:
             try:
                 s1, s2 = ap.split('-')
-                if s1 in price_matrix.columns and s2 in price_matrix.columns:
-                    if (s1, s2) not in all_combos and (s2, s1) not in all_combos:
-                        all_combos.append((s1, s2))
-            except Exception:
+                if s1 in price_matrix.columns and s2 in price_matrix.columns and (s1, s2) not in all_combos:
+                    all_combos.append((s1, s2))
+            except:
                 continue
 
         results = []
@@ -125,79 +76,49 @@ class PairCombine:
 
         for s1, s2 in all_combos:
             try:
-                # [核心防禦] 針對正在計算的這一對幣，獨立去除 NaN
-                # 這樣一來，BTC/ETH 會有 984 筆，而 BTC/BSB(新幣) 也能用僅有的 103 筆順利計算
+                # 獨立去除 NaN，確保即使長度不同也能計算
                 pair_df = price_matrix[[s1, s2]].dropna()
-
-                # 如果兩者重疊的歷史數據太少，則不具備統計意義，直接跳過
-                if len(pair_df) < 100:
-                    continue
-
-                y = pair_df[s1]
-                x = pair_df[s2]
+                if len(pair_df) < 100: continue
+                y, x = pair_df[s1], pair_df[s2]
                 pair_name = f"{s1}-{s2}"
-
-                # 標註是否為當前持倉
                 is_active = pair_name in active_pairs
 
-                # --- [A. 共整合測試 (Engle-Granger)] ---
-                score, p_value, _ = coint(y, x)
+                # 🛡️ 鐵血防線 1：必須是強正相關 (Correlation > 0.5)
+                correlation = y.corr(x)
+                if correlation < 0.5 and not is_active: continue
 
-                # 🛡️ [過濾] 如果不是持倉組合且 P-Value 過高，則不記錄以節省資源
-                if p_value >= 0.05 and not is_active:
-                    continue
-
-                # --- [B. 回歸參數計算 (Log-Scale)] ---
                 x_with_const = sm.add_constant(x)
                 model = sm.OLS(y, x_with_const).fit()
                 beta = model.params.iloc[1]
-                alpha = model.params.iloc[0]
 
-                # --- [C. 殘差與 Z-Score 計算] ---
+                # 🛡️ 鐵血防線 2：Beta 必須大於 0
+                if beta <= 0 and not is_active: continue
+
+                # 🛡️ 鐵血防線 3：P-Value 必須過關 (強共整合)
+                _, p_value, _ = coint(y, x)
+                if p_value >= 0.05 and not is_active: continue
+
+                alpha = model.params.iloc[0]
                 spread = y - (beta * x + alpha)
                 spread_std = spread.std()
-                # 恢復 Z-Score 計算中的 Mean 校準
+                # Z-Score 正規化
                 last_z = (spread.iloc[-1] - spread.mean()) / spread_std if spread_std != 0 else 0
 
-                # --- [D. 附加指標恢復 (Dashboard 所需)] ---
-                correlation = y.corr(x)
-                last_p1 = np.exp(y.iloc[-1])  # 從對數還原成真實價格
-                last_p2 = np.exp(x.iloc[-1])
-
-                # --- [E. 半衰期] ---
-                half_life = self.calculate_half_life(spread)
-
                 results.append({
-                    'timestamp': scan_time,
-                    'pair': pair_name,
-                    's1': s1, 's2': s2,
-                    'p_value': round(float(p_value), 5),
-                    'correlation': round(float(correlation), 4),
-                    'beta': round(float(beta), 4),
-                    'alpha': round(float(alpha), 4),
-                    'spread_std': round(float(spread_std), 6),
-                    'last_z_score': round(float(last_z), 4),
-                    'half_life': round(float(half_life), 2),
-                    'last_p1': round(float(last_p1), 6),
-                    'last_p2': round(float(last_p2), 6),
-                    'data_points': len(y),
-                    'is_active': is_active
+                    'timestamp': scan_time, 'pair': pair_name, 's1': s1, 's2': s2,
+                    'p_value': round(float(p_value), 5), 'correlation': round(float(correlation), 4),
+                    'beta': round(float(beta), 4), 'alpha': round(float(alpha), 4),
+                    'spread_std': round(float(spread_std), 6), 'last_z_score': round(float(last_z), 4),
+                    'half_life': round(self.calculate_half_life(spread), 2),
+                    'last_p1': round(np.exp(y.iloc[-1]), 6), 'last_p2': round(np.exp(x.iloc[-1]), 6),
+                    'data_points': len(y), 'is_active': is_active
                 })
-
-            except Exception:
+            except:
                 continue
 
-        if not results:
-            logger.warning("📡 No valid pairs found in this scan.")
-            return
-
-        # 3. 排序並增加排名與 Top 10 標註
-        df_results = pd.DataFrame(results).sort_values(by='p_value').reset_index(drop=True)
-        df_results['rank'] = df_results.index + 1
-        df_results['is_top_10'] = df_results['rank'] <= 10
-
-        # 採用 Append 模式紀錄，保留歷史軌跡
-        file_exists = self.log_filepath.exists()
-        df_results.to_csv(self.log_filepath, mode='a', index=False, header=not file_exists)
-
-        logger.success(f"✅ Co-integration scan completed. Logged {len(df_results)} pairs.")
+        if results:
+            df_results = pd.DataFrame(results).sort_values(by='p_value').reset_index(drop=True)
+            df_results['rank'] = df_results.index + 1
+            df_results['is_top_10'] = df_results['rank'] <= 10
+            df_results.to_csv(self.log_filepath, mode='a', index=False, header=not self.log_filepath.exists())
+            logger.success(f"✅ 篩選完成！獲得 {len(df_results)} 對「高純度正相關」組合。")
