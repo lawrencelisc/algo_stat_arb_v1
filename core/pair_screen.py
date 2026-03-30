@@ -16,7 +16,7 @@ class PairCombine:
                     calculating Beta, Half-life, and restoring dashboard fields.
     Optimized: Handles index alignment to prevent "Empty Matrix" errors.
     """
-    VERSION = "v3.2.5-Safety"
+    VERSION = "v3.2.6-Safety"
 
     def __init__(self):
         # 路徑定義
@@ -59,7 +59,7 @@ class PairCombine:
     def load_log_prices(self, symbol_list, timeframe='1h'):
         """
         載入 Parquet 並使用 concat 確保對齊。
-        [優化]：使用 ffill 容許微小數據缺失，防止矩陣變空。
+        [終極優化]：完全捨棄全局 dropna()，容許 NaN 存在，交由兩兩配對時獨立處理。
         """
         series_dict = {}
         for sym in symbol_list:
@@ -87,13 +87,10 @@ class PairCombine:
         if not series_dict:
             return pd.DataFrame()
 
-        # [修復邏輯] 使用 concat axis=1 進行 index 對齊
-        # 使用 ffill(limit=3) 容許最多 3 根 K 線的缺失，確保矩陣不會因為數據不齊而變空
+        # [完美修復邏輯] 使用 concat axis=1 進行 index 對齊，僅作輕微向前填充
+        # ⚠️ 絕對不在這裡執行 .dropna()，這會讓新幣種的缺失歷史毀掉所有其他幣種！
         final_df = pd.concat(series_dict, axis=1).sort_index()
-        final_df = final_df.ffill(limit=3).dropna()
-
-        if final_df.empty:
-            logger.warning("⚠️ Data alignment failed: No common time overlap found among symbols.")
+        final_df = final_df.ffill(limit=3)
 
         return final_df
 
@@ -104,7 +101,7 @@ class PairCombine:
         logger.info(f"🔍 Starting co-integration scan for {len(symbol_list)} symbols...")
         active_pairs = active_pairs or []
 
-        # 1. 載入並對齊對數價格矩陣
+        # 1. 載入並對齊對數價格矩陣 (此時矩陣內允許包含 NaN)
         price_matrix = self.load_log_prices(symbol_list, timeframe)
         if price_matrix.empty:
             logger.warning("⚠️ Price matrix is empty. Research log will not be updated.")
@@ -128,8 +125,16 @@ class PairCombine:
 
         for s1, s2 in all_combos:
             try:
-                y = price_matrix[s1]
-                x = price_matrix[s2]
+                # [核心防禦] 針對正在計算的這一對幣，獨立去除 NaN
+                # 這樣一來，BTC/ETH 會有 984 筆，而 BTC/BSB(新幣) 也能用僅有的 103 筆順利計算
+                pair_df = price_matrix[[s1, s2]].dropna()
+
+                # 如果兩者重疊的歷史數據太少，則不具備統計意義，直接跳過
+                if len(pair_df) < 100:
+                    continue
+
+                y = pair_df[s1]
+                x = pair_df[s2]
                 pair_name = f"{s1}-{s2}"
 
                 # 標註是否為當前持倉

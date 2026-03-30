@@ -1,5 +1,6 @@
 import pandas as pd
 import ccxt
+import yaml
 import os
 import numpy as np
 from pathlib import Path
@@ -13,7 +14,7 @@ class ExecutionManager:
     Location: /utils/execution.py
     Responsibility: Read signals from signal_table.csv and execute dual-leg trades on Bybit.
     """
-    VERSION = "v3.1.2-Guardian"
+    VERSION = "v3.1.4-Standalone-Guardian"
 
     def __init__(self, budget_per_pair=1500.0):
         self.root_dir = Path(__file__).resolve().parent.parent
@@ -21,34 +22,48 @@ class ExecutionManager:
         self.trade_record_path = self.root_dir / 'data' / 'trade' / 'trade_record.csv'
         self.budget = budget_per_pair
 
-        # --- [修復：模組路徑容錯引進] ---
+        # --- [終極防禦：獨立讀取 Config，切斷所有模組依賴] ---
+        # 徹底解決 No module named 'core.connect' 的崩潰問題
         try:
-            # 優先嘗試引進 api_connect，若失敗則嘗試 connect
-            try:
-                from core.api_connect import DataBridge
-            except ImportError:
-                from core.connect import DataBridge
+            config_path = self.root_dir / 'config' / 'config.yaml'
+            if not config_path.exists():
+                config_path = self.root_dir / 'config.yaml'  # 備用路徑
 
-            self.bridge = DataBridge()
-            api_config = self.bridge.load_bybit_api_config('algo_pair_trade')
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = yaml.safe_load(f)
+
+            api_key = None
+            api_secret = None
+
+            # 優先支援舊版 algo_pair_trade 格式
+            if 'algo_pair_trade' in config:
+                api_key = config['algo_pair_trade'].get('PT_API_KEY')
+                api_secret = config['algo_pair_trade'].get('PT_SECRET_KEY')
+
+            # 若無，支援超旗艦版 ACCOUNTS 格式 (抓取第一個可用帳號)
+            if not api_key and 'ACCOUNTS' in config:
+                for acc_name, acc_data in config['ACCOUNTS'].items():
+                    api_key = acc_data.get('key')
+                    api_secret = acc_data.get('secret')
+                    if api_key: break
+
+            if not api_key or not api_secret:
+                raise ValueError("API Keys not found in config.yaml")
 
             self.exchange = ccxt.bybit({
-                'apiKey': api_config['PT_API_KEY'],
-                'secret': api_config['PT_SECRET_KEY'],
+                'apiKey': api_key,
+                'secret': api_secret,
                 'enableRateLimit': True,
                 'options': {'defaultType': 'linear'}
             })
-            logger.info(f"✅ ExecutionManager {self.VERSION} connected to Bybit.")
+            logger.info(f"✅ ExecutionManager {self.VERSION} successfully connected to Bybit.")
         except Exception as e:
-            # 此處報錯會被 main_entry.py 捕捉
-            logger.error(f"❌ Failed to initialize Exchange: {e}")
+            logger.error(f"❌ ExecutionManager init failed: {e}")
             raise
 
-        # Ensure directories exist
         self.trade_record_path.parent.mkdir(parents=True, exist_ok=True)
 
     def get_open_positions(self):
-        """Fetch current open positions from local CSV records."""
         if not self.trade_record_path.exists():
             return pd.DataFrame()
         try:
@@ -59,10 +74,7 @@ class ExecutionManager:
             return pd.DataFrame()
 
     def execute_trades(self):
-        """
-        Processes signals and manages Bybit positions.
-        Called every 5 minutes by main_entry.py.
-        """
+        """Called every 5 minutes by main_entry.py"""
         if not self.signal_table_path.exists():
             return
 
@@ -73,10 +85,10 @@ class ExecutionManager:
 
             for _, sig in signals.iterrows():
                 pair = sig['pair']
-                z = sig['z_score']
+                z = float(sig['z_score'])
                 action = sig.get('action', 'MONITORING')
 
-                # --- 邏輯 A: 緊急撤退 (P-Value 失效) ---
+                # --- 邏輯 A: 緊急撤退 (P-Value 失效 / Signal Expired) ---
                 if action == 'FORCE_EXIT_EXPIRED' and pair in active_pairs:
                     self._close_pair_position(pair, "SIGNAL_EXPIRED")
                     continue
@@ -98,7 +110,6 @@ class ExecutionManager:
             logger.error(f"❌ Execution loop error: {e}")
 
     def _open_pair_position(self, pair, sig, side):
-        """執行雙腿開倉下單邏輯 (市價單)"""
         s1, s2 = sig['pair'].split('-')
         beta = float(sig['beta'])
         try:
@@ -130,7 +141,6 @@ class ExecutionManager:
             logger.error(f"❌ Open failed {pair}: {e}")
 
     def _close_pair_position(self, pair, reason):
-        """執行雙腿平倉離場邏輯 (Reduce Only)"""
         try:
             df = pd.read_csv(self.trade_record_path)
             idx = df[(df['pair'] == pair) & (df['status'] == 'OPEN')].index
@@ -138,7 +148,7 @@ class ExecutionManager:
             trade = df.loc[idx[0]]
 
             s1, s2 = trade['s1'], trade['s2']
-            qty1, qty2 = trade['qty1'], trade['qty2']
+            qty1, qty2 = float(trade['qty1']), float(trade['qty2'])
             s1_close = 'sell' if trade['side'] == 'LONG_SPREAD' else 'buy'
             s2_close = 'buy' if trade['side'] == 'LONG_SPREAD' else 'sell'
 
