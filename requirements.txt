@@ -10,3 +10,4 @@ streamlit
 plotly
 pathlib
 streamlit-autorefresh
+matplotlib
