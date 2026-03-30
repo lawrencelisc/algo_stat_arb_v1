@@ -1,196 +1,73 @@
-import pandas as pd
-import numpy as np
-import statsmodels.api as sm
+import yaml
+import os
+import gc
 from pathlib import Path
-from statsmodels.tsa.stattools import coint
-from itertools import combinations
-from datetime import datetime, timezone
 from loguru import logger
 
 
-class PairCombine:
+class DataBridge:
     """
-    [STAGE 2] Pair Screener Module
-    Location: /core/pair_screen.py
-    Responsibility: Log-price transformation, Cointegration testing (EG Test),
-                    calculating Beta, Half-life, and restoring dashboard fields.
-    Optimized: Handles index alignment to prevent "Empty Matrix" errors.
+    [STAGE 0] 數據橋樑模組 (Data Bridge)
+    負責從外部配置檔案（config.yaml）安全地讀取 API 金鑰與通訊配置。
     """
-    VERSION = "v3.2.4-Safety"
+    VERSION = "v3.1.0-Stable"
 
     def __init__(self):
-        # 路徑定義
-        self.root_dir = Path(__file__).resolve().parent.parent
-        self.data_dir = self.root_dir / 'data' / 'rawdata'
-        self.result_folder = self.root_dir / 'result'
-        self.log_filepath = self.result_folder / 'master_research_log.csv'
+        self.config_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
 
-        # 確保結果目錄存在
-        self.result_folder.mkdir(parents=True, exist_ok=True)
-        logger.info(f'🛰️ PairCombine {self.VERSION} initialized.')
-
-    def calculate_half_life(self, spread):
-        """
-        計算殘差回歸的半衰期 (Mean Reversion Speed)
-        """
-        spread = spread.dropna()
-        if len(spread) <= 1:
-            return 9999.0
-
-        spread_lag = spread.shift(1)
-        spread_ret = spread - spread_lag
-
-        # 移除空值以進行回歸
-        valid_idx = spread_ret.index[1:]
-        y = spread_ret.loc[valid_idx]
-        x = sm.add_constant(spread_lag.loc[valid_idx])
-
+    def load_bybit_api_config(self, account_name='algo_pair_trade'):
         try:
-            model = sm.OLS(y, x)
-            res = model.fit()
-            theta = res.params.iloc[1]
-            if theta >= 0:
-                return 9999.0  # 不具備回歸特性
-            half_life = -np.log(2) / theta
-            return half_life
-        except Exception:
-            return 9999.0
+            if not self.config_path.exists():
+                raise FileNotFoundError(f"Config file not found: {self.config_path}")
 
-    def load_log_prices(self, symbol_list, timeframe='1h'):
-        """
-        載入 Parquet 並使用 concat 確保對齊。
-        [優化]：使用 ffill 容許微小數據缺失，防止矩陣變空。
-        """
-        series_dict = {}
-        for sym in symbol_list:
-            # 搜尋對應的 Parquet 檔案
-            files = list(self.data_dir.glob(f"{sym}_{timeframe}_*.parquet"))
-            if not files:
-                continue
+            with open(self.config_path, 'r', encoding='utf-8') as file:
+                config = yaml.safe_load(file)
 
-            # 讀取最新的數據檔案
-            latest_file = max(files, key=lambda x: x.stat().st_mtime)
-            try:
-                df = pd.read_parquet(latest_file)
-                if df.empty: continue
+                # 支援超旗艦版 ACCOUNTS 區塊
+                if 'ACCOUNTS' in config:
+                    acc_data = config['ACCOUNTS'].get(account_name)
+                    if acc_data:
+                        logger.info(f"✅ Loaded {account_name} credentials from ACCOUNTS")
+                        return {
+                            'PT_API_KEY': acc_data.get('key'),
+                            'PT_SECRET_KEY': acc_data.get('secret')
+                        }
 
-                # 確保 index 是時間格式以便對齊
-                if not isinstance(df.index, pd.DatetimeIndex):
-                    df.index = pd.to_datetime(df.index)
+                # 備選：支援舊版 algo_pair_trade 區塊
+                sub_config = config.get(account_name, {})
+                if not sub_config:
+                    sub_config = config.get('algo_pair_trade', {})
 
-                # [核心] 應用對數價格轉化 (Log-Price)
-                # 使用 c (Close) 價格，並確保數據按時間排序
-                df = df.sort_index()
-                series_dict[sym] = np.log(df['c'])
-            except Exception as e:
-                logger.error(f"❌ Failed to load {sym}: {e}")
+                if 'PT_API_KEY' in sub_config and 'PT_SECRET_KEY' in sub_config:
+                    logger.info(f"✅ Loaded Bybit API config from {account_name}")
+                    gc.collect()
+                    return sub_config
 
-        if not series_dict:
-            return pd.DataFrame()
+                raise Exception(f'Account {account_name} or keys not found in config.yaml')
 
-        # [修復邏輯] 使用 concat axis=1 進行 index 對齊
-        # 使用 ffill(limit=3) 容許最多 3 根 K 線的缺失（對於 1h 週期已經非常寬鬆）
-        # 然後再執行 dropna() 確保所有組合在計算時都有完整的對應數據點
-        final_df = pd.concat(series_dict, axis=1).sort_index()
-        final_df = final_df.ffill(limit=3).dropna()
+        except Exception as e:
+            logger.error(f"❌ Error loading Bybit API config: {e}")
+            raise
 
-        if final_df.empty:
-            logger.warning("⚠️ Data alignment failed: No common time overlap found among symbols.")
+    def load_tg_config(self):
+        try:
+            if not self.config_path.exists():
+                raise FileNotFoundError(f"Config file not found: {self.config_path}")
 
-        return final_df
+            with open(self.config_path, 'r', encoding='utf-8') as file:
+                config = yaml.safe_load(file)
+                tg_config = config.get('tg_bot', {})
+                if not tg_config:
+                    tg_config = config.get('TG_BOT', {})
 
-    def pair_screener(self, symbol_list, timeframe='1h', active_pairs=None):
-        """
-        核心篩選邏輯：遍歷所有組合並強制計算持倉配對
-        """
-        logger.info(f"🔍 Starting co-integration scan for {len(symbol_list)} symbols...")
-        active_pairs = active_pairs or []
+                required_keys = ['TOKEN', 'GROUP_ID']
+                for key in required_keys:
+                    if key not in tg_config or not tg_config[key]:
+                        raise Exception(f'Missing or empty {key} in config.yaml')
 
-        # 1. 載入並對齊對數價格矩陣
-        price_matrix = self.load_log_prices(symbol_list, timeframe)
-        if price_matrix.empty:
-            logger.warning("⚠️ Price matrix is empty. Research log will not be updated.")
-            return
-
-        # 2. 生成所有可能的配對組合
-        all_combos = list(combinations(price_matrix.columns, 2))
-
-        # 確保持倉中的配對即便不在 Top List 也會被加入掃描
-        for ap in active_pairs:
-            try:
-                s1, s2 = ap.split('-')
-                if s1 in price_matrix.columns and s2 in price_matrix.columns:
-                    if (s1, s2) not in all_combos and (s2, s1) not in all_combos:
-                        all_combos.append((s1, s2))
-            except Exception:
-                continue
-
-        results = []
-        scan_time = datetime.now(timezone.utc).isoformat()
-
-        for s1, s2 in all_combos:
-            try:
-                y = price_matrix[s1]
-                x = price_matrix[s2]
-                pair_name = f"{s1}-{s2}"
-
-                # --- [A. 共整合測試 (Engle-Granger)] ---
-                score, p_value, _ = coint(y, x)
-
-                # --- [B. 回歸參數計算 (Log-Scale)] ---
-                x_with_const = sm.add_constant(x)
-                model = sm.OLS(y, x_with_const).fit()
-                beta = model.params.iloc[1]
-                alpha = model.params.iloc[0]
-
-                # --- [C. 殘差與 Z-Score 計算] ---
-                spread = y - (beta * x + alpha)
-                spread_std = spread.std()
-                # 恢復 Z-Score 計算中的 Mean 校準
-                last_z = (spread.iloc[-1] - spread.mean()) / spread_std if spread_std != 0 else 0
-
-                # --- [D. 附加指標恢復 (Dashboard 所需)] ---
-                correlation = y.corr(x)
-                last_p1 = np.exp(y.iloc[-1])  # 從對數還原成真實價格
-                last_p2 = np.exp(x.iloc[-1])
-
-                # --- [E. 半衰期] ---
-                half_life = self.calculate_half_life(spread)
-
-                # 標註是否為當前持倉
-                is_active = pair_name in active_pairs
-
-                results.append({
-                    'timestamp': scan_time,
-                    'pair': pair_name,
-                    's1': s1, 's2': s2,
-                    'p_value': round(float(p_value), 5),
-                    'correlation': round(float(correlation), 4),
-                    'beta': round(float(beta), 4),
-                    'alpha': round(float(alpha), 4),
-                    'spread_std': round(float(spread_std), 6),
-                    'last_z_score': round(float(last_z), 4),
-                    'half_life': round(float(half_life), 2),
-                    'last_p1': round(float(last_p1), 6),
-                    'last_p2': round(float(last_p2), 6),
-                    'data_points': len(y),
-                    'is_active': is_active
-                })
-
-            except Exception:
-                continue
-
-        if not results:
-            logger.warning("📡 No valid pairs found in this scan.")
-            return
-
-        # 3. 排序並增加排名與 Top 10 標註
-        df_results = pd.DataFrame(results).sort_values(by='p_value').reset_index(drop=True)
-        df_results['rank'] = df_results.index + 1
-        df_results['is_top_10'] = df_results['rank'] <= 10
-
-        # 採用 Append 模式紀錄，保留歷史軌跡
-        file_exists = self.log_filepath.exists()
-        df_results.to_csv(self.log_filepath, mode='a', index=False, header=not file_exists)
-
-        logger.success(f"✅ Co-integration scan completed. Logged {len(df_results)} pairs.")
+                logger.info("✅ Loaded Telegram Bot config")
+                gc.collect()
+                return tg_config
+        except Exception as e:
+            logger.error(f"❌ Error loading Telegram config: {e}")
+            raise
