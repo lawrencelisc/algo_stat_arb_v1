@@ -16,7 +16,7 @@ class PairCombine:
                     calculating Beta, Half-life, and restoring dashboard fields.
     Optimized: Handles index alignment to prevent "Empty Matrix" errors.
     """
-    VERSION = "v3.2.3-Safety"
+    VERSION = "v3.2.5-Safety"
 
     def __init__(self):
         # 路徑定義
@@ -58,7 +58,8 @@ class PairCombine:
 
     def load_log_prices(self, symbol_list, timeframe='1h'):
         """
-        載入 Parquet 並使用 concat 確保對齊，防止不同幣種時間點不一時產生全空問題。
+        載入 Parquet 並使用 concat 確保對齊。
+        [優化]：使用 ffill 容許微小數據缺失，防止矩陣變空。
         """
         series_dict = {}
         for sym in symbol_list:
@@ -78,6 +79,7 @@ class PairCombine:
                     df.index = pd.to_datetime(df.index)
 
                 # [核心] 應用對數價格轉化 (Log-Price)
+                df = df.sort_index()
                 series_dict[sym] = np.log(df['c'])
             except Exception as e:
                 logger.error(f"❌ Failed to load {sym}: {e}")
@@ -86,12 +88,12 @@ class PairCombine:
             return pd.DataFrame()
 
         # [修復邏輯] 使用 concat axis=1 進行 index 對齊
-        # 使用 ffill 容許微小的數據缺失 (最多 1 根 K 線)，確保矩陣不會因為極少數缺失而變空
+        # 使用 ffill(limit=3) 容許最多 3 根 K 線的缺失，確保矩陣不會因為數據不齊而變空
         final_df = pd.concat(series_dict, axis=1).sort_index()
-        final_df = final_df.ffill(limit=1).dropna()
+        final_df = final_df.ffill(limit=3).dropna()
 
         if final_df.empty:
-            logger.warning("⚠️ Data alignment failed: No common time overlap found.")
+            logger.warning("⚠️ Data alignment failed: No common time overlap found among symbols.")
 
         return final_df
 
@@ -130,8 +132,15 @@ class PairCombine:
                 x = price_matrix[s2]
                 pair_name = f"{s1}-{s2}"
 
+                # 標註是否為當前持倉
+                is_active = pair_name in active_pairs
+
                 # --- [A. 共整合測試 (Engle-Granger)] ---
                 score, p_value, _ = coint(y, x)
+
+                # 🛡️ [過濾] 如果不是持倉組合且 P-Value 過高，則不記錄以節省資源
+                if p_value >= 0.05 and not is_active:
+                    continue
 
                 # --- [B. 回歸參數計算 (Log-Scale)] ---
                 x_with_const = sm.add_constant(x)
@@ -142,7 +151,8 @@ class PairCombine:
                 # --- [C. 殘差與 Z-Score 計算] ---
                 spread = y - (beta * x + alpha)
                 spread_std = spread.std()
-                last_z = spread.iloc[-1] / spread_std
+                # 恢復 Z-Score 計算中的 Mean 校準
+                last_z = (spread.iloc[-1] - spread.mean()) / spread_std if spread_std != 0 else 0
 
                 # --- [D. 附加指標恢復 (Dashboard 所需)] ---
                 correlation = y.corr(x)
@@ -151,9 +161,6 @@ class PairCombine:
 
                 # --- [E. 半衰期] ---
                 half_life = self.calculate_half_life(spread)
-
-                # 標註是否為當前持倉
-                is_active = pair_name in active_pairs
 
                 results.append({
                     'timestamp': scan_time,
@@ -164,7 +171,7 @@ class PairCombine:
                     'beta': round(float(beta), 4),
                     'alpha': round(float(alpha), 4),
                     'spread_std': round(float(spread_std), 6),
-                    'last_z_score': round(float(last_z), 4),  # current_z
+                    'last_z_score': round(float(last_z), 4),
                     'half_life': round(float(half_life), 2),
                     'last_p1': round(float(last_p1), 6),
                     'last_p2': round(float(last_p2), 6),
