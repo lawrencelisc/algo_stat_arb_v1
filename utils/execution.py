@@ -14,7 +14,7 @@ class ExecutionManager:
     Location: /utils/execution.py
     Responsibility: Read signals from signal_table.csv and execute dual-leg trades on Bybit.
     """
-    VERSION = "v3.1.5-Standalone-Guardian"
+    VERSION = "v3.1.6-Standalone-Guardian"
 
     def __init__(self, budget_per_pair=1500.0):
         self.root_dir = Path(__file__).resolve().parent.parent
@@ -111,7 +111,6 @@ class ExecutionManager:
         s1, s2 = sig['pair'].split('-')
         beta = float(sig['beta'])
 
-        # 轉換為 CCXT 標準格式
         s1_ccxt = self._to_ccxt_symbol(s1)
         s2_ccxt = self._to_ccxt_symbol(s2)
 
@@ -119,19 +118,23 @@ class ExecutionManager:
             prices = self.exchange.fetch_tickers([s1_ccxt, s2_ccxt])
             p1, p2 = prices[s1_ccxt]['last'], prices[s2_ccxt]['last']
 
-            qty1 = self.budget / p1
-            qty2 = (self.budget * beta) / p2
+            # [修復] 強制使用絕對值，保證數量永遠為正
+            qty1 = abs(self.budget / p1)
+            qty2 = abs((self.budget * beta) / p2)
 
-            # 使用 CCXT 格式處理精度
             qty1 = float(self.exchange.amount_to_precision(s1_ccxt, qty1))
             qty2 = float(self.exchange.amount_to_precision(s2_ccxt, qty2))
 
-            s1_side = 'buy' if side == 'LONG_SPREAD' else 'sell'
-            s2_side = 'sell' if side == 'LONG_SPREAD' else 'buy'
+            # [修復] 根據 Beta 的正負號，動態決定做多還是做空
+            if side == 'LONG_SPREAD':
+                s1_side = 'buy'
+                s2_side = 'sell' if beta > 0 else 'buy'
+            else:  # SHORT_SPREAD
+                s1_side = 'sell'
+                s2_side = 'buy' if beta > 0 else 'sell'
 
-            logger.info(f"🚀 [EXEC] {side} {pair} | S1:{s1_side} {qty1} | S2:{s2_side} {qty2}")
+            logger.info(f"🚀 [EXEC] {side} {pair} | Beta:{beta:.2f} | S1:{s1_side} {qty1} | S2:{s2_side} {qty2}")
 
-            # 使用 CCXT 格式發送訂單
             self.exchange.create_order(s1_ccxt, 'market', s1_side, qty1)
             self.exchange.create_order(s2_ccxt, 'market', s2_side, qty2)
 
@@ -156,16 +159,21 @@ class ExecutionManager:
 
             s1, s2 = trade['s1'], trade['s2']
             qty1, qty2 = float(trade['qty1']), float(trade['qty2'])
-            s1_close = 'sell' if trade['side'] == 'LONG_SPREAD' else 'buy'
-            s2_close = 'buy' if trade['side'] == 'LONG_SPREAD' else 'sell'
+            beta = float(trade['beta'])
 
-            # 轉換為 CCXT 標準格式
+            # [修復] 根據進場方向與 Beta 正負號，反向平倉
+            if trade['side'] == 'LONG_SPREAD':
+                s1_close = 'sell'
+                s2_close = 'buy' if beta > 0 else 'sell'
+            else:  # SHORT_SPREAD
+                s1_close = 'buy'
+                s2_close = 'sell' if beta > 0 else 'buy'
+
             s1_ccxt = self._to_ccxt_symbol(s1)
             s2_ccxt = self._to_ccxt_symbol(s2)
 
             logger.warning(f"⚡ [EXEC] Closing {pair} | Reason: {reason}")
 
-            # 使用 CCXT 格式發送平倉訂單
             self.exchange.create_order(s1_ccxt, 'market', s1_close, qty1, params={'reduceOnly': True})
             self.exchange.create_order(s2_ccxt, 'market', s2_close, qty2, params={'reduceOnly': True})
 
