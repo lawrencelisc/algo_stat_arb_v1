@@ -10,164 +10,167 @@ from loguru import logger
 
 class PairCombine:
     """
-    [STAGE 2] Pair Screener Module v3.1.2-Stable
-    - 核心修復：應用對數價格轉化 (Log-Price Transformation)。
-    - 強制監控：確保持倉組合無論數學指標如何，均維持監控，解決 Wait Scan 與「有始有終」問題。
+    [STAGE 1] Pair Screener Module
+    Location: /core/pair_screen.py
+    Responsibility: Log-price transformation, Cointegration testing (EG Test),
+                    calculating Beta, Half-life, and restoring dashboard fields.
     """
-    VERSION = "v3.1.2-Stable"
+    VERSION = "v3.2.1-Safety"
 
     def __init__(self):
+        # Path definitions
         self.root_dir = Path(__file__).resolve().parent.parent
         self.data_dir = self.root_dir / 'data' / 'rawdata'
         self.result_folder = self.root_dir / 'result'
-        logger.info(f'🛰️ PairCombine {self.VERSION} 模組初始化完成。')
+        self.log_filepath = self.result_folder / 'master_research_log.csv'
+
+        # Ensure result directory exists
+        self.result_folder.mkdir(parents=True, exist_ok=True)
+        logger.info(f'🛰️ PairCombine {self.VERSION} initialized.')
 
     def calculate_half_life(self, spread):
-        """計算殘差回歸的半衰期"""
+        """
+        Calculates the Half-Life of mean reversion for the spread.
+        """
         spread = spread.dropna()
-        if len(spread) <= 1: return np.nan
+        if len(spread) <= 1:
+            return 9999.0
+
         spread_lag = spread.shift(1)
         spread_ret = spread - spread_lag
-        spread_ret = spread_ret.dropna()
-        spread_lag = spread_lag.dropna()
-        spread_lag_with_const = sm.add_constant(spread_lag)
+
+        # Drop NaNs for regression
+        valid_idx = spread_ret.index[1:]
+        y = spread_ret.loc[valid_idx]
+        x = sm.add_constant(spread_lag.loc[valid_idx])
+
         try:
-            model = sm.OLS(spread_ret, spread_lag_with_const)
+            model = sm.OLS(y, x)
             res = model.fit()
             theta = res.params.iloc[1]
-            if theta >= 0: return np.nan
-            return -np.log(2) / theta
+            if theta >= 0:
+                return 9999.0  # Non-stationary or trending
+            half_life = -np.log(2) / theta
+            return half_life
         except Exception:
-            return np.nan
+            return 9999.0
 
-    def pair_screener(self, coin_list, timeframe='1h', active_pairs=None):
+    def load_log_prices(self, symbol_list, timeframe='1h'):
         """
-        全市場配對篩選器
-        :param active_pairs: 傳入當前持倉的 Pair 名稱列表 (例如: ['DOGEUSDT-BNBUSDT'])
+        Loads Parquet data and transforms to log-prices.
         """
-        logger.info(f"🚀 PairCombine {self.VERSION} 啟動全市場掃描...")
+        data_dict = {}
+        for sym in symbol_list:
+            # Search for corresponding Parquet files
+            files = list(self.data_dir.glob(f"{sym}_{timeframe}_*.parquet"))
+            if not files:
+                continue
+
+            # Read the latest data file
+            latest_file = max(files, key=lambda x: x.stat().st_mtime)
+            try:
+                df = pd.read_parquet(latest_file)
+                if df.empty: continue
+
+                # Apply Log-Price Transformation
+                data_dict[sym] = np.log(df['c'])
+            except Exception as e:
+                logger.error(f"❌ Failed to load {sym}: {e}")
+
+        return pd.DataFrame(data_dict).dropna()
+
+    def pair_screener(self, symbol_list, timeframe='1h', active_pairs=None):
+        """
+        Core logic: Iterates through combinations and forces calculation for active pairs.
+        Restores dashboard fields: correlation, last_p1, last_p2, rank, is_top_10.
+        """
+        logger.info(f"🔍 Starting co-integration scan for {len(symbol_list)} symbols...")
         active_pairs = active_pairs or []
 
-        self.result_folder.mkdir(parents=True, exist_ok=True)
-        log_filepath = self.result_folder / 'master_research_log.csv'
+        # 1. Load log-price matrix
+        price_matrix = self.load_log_prices(symbol_list, timeframe)
+        if price_matrix.empty:
+            logger.warning("⚠️ Price matrix is empty. No data to process.")
+            return
 
-        if not self.data_dir.exists():
-            logger.error("❌ 原始數據目錄不存在。")
-            return None
+        # 2. Generate all possible pair combinations
+        all_combos = list(combinations(price_matrix.columns, 2))
 
-        files = [f for f in self.data_dir.iterdir() if f.name.endswith('.parquet')]
-        if not files:
-            logger.warning("⚠️ 未發現任何 Parquet 數據文件。")
-            return None
-
-        price_data = {}
-        clean_coin_list = [c.split('/')[0] + "USDT" if '/' in c else c.upper() for c in coin_list]
-        pd_timeframe = timeframe.lower().replace('m', 'min') if timeframe.endswith('m') else timeframe
-
-        # 1. 載入並重採樣價格數據
-        for file_path in files:
-            symbol = file_path.name.split('_')[0]
-            if symbol not in clean_coin_list: continue
+        # Ensure active pairs are included even if not in the top list
+        for ap in active_pairs:
             try:
-                df = pd.read_parquet(file_path)
-                time_col = next((col for col in ['timestamp', 'time', 'date', 'ts'] if col in df.columns), None)
-                if time_col:
-                    if pd.api.types.is_numeric_dtype(df[time_col]):
-                        df[time_col] = pd.to_datetime(df[time_col], unit='ms' if df[time_col].max() > 1e11 else 's')
-                    else:
-                        df[time_col] = pd.to_datetime(df[time_col])
-                    df.set_index(time_col, inplace=True)
-                else:
-                    df.index = pd.to_datetime(df.index)
-
-                df = df.sort_index()
-                df.columns = [c.lower() for c in df.columns]
-                # 取最後一筆成交價作為 K 線價格
-                df_resampled = df.resample(pd_timeframe).agg({'c': 'last'}).dropna()
-                price_data[symbol] = df_resampled['c']
-            except Exception as e:
-                logger.error(f"❌ 處理 {symbol} 數據失敗: {e}")
+                s1, s2 = ap.split('-')
+                if s1 in price_matrix.columns and s2 in price_matrix.columns:
+                    if (s1, s2) not in all_combos and (s2, s1) not in all_combos:
+                        all_combos.append((s1, s2))
+            except Exception:
                 continue
-
-        df_prices = pd.DataFrame(price_data).dropna()
-        symbols = df_prices.columns.tolist()
-        data_points = len(df_prices)
-
-        if len(symbols) < 2:
-            logger.warning("⚠️ 有效幣種不足，無法進行配對。")
-            return None
 
         results = []
-        scan_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        scan_time = datetime.now(timezone.utc).isoformat()
 
-        # 2. 遍歷所有可能的對沖組合
-        for sym1, sym2 in combinations(symbols, 2):
-            pair_name = f"{sym1}-{sym2}"
-            # 🔄 檢查該組合是否正在持倉中 (支援雙向名稱檢查)
-            is_active = (pair_name in active_pairs) or (f"{sym2}-{sym1}" in active_pairs)
-
-            raw_y = df_prices[sym1]
-            raw_x = df_prices[sym2]
-
-            correlation = raw_y.corr(raw_x)
-
-            # 🛡️ [修正]：如果是持倉中組合，即使相關性低於 0.4 也要計算，否則不予通過
-            if correlation < 0.4 and not is_active:
-                continue
-
+        for s1, s2 in all_combos:
             try:
-                # 🎯 核心運算：將價格轉為對數尺度計算 Log-Beta
-                y = np.log(raw_y)
-                x = np.log(raw_x)
+                y = price_matrix[s1]
+                x = price_matrix[s2]
+                pair_name = f"{s1}-{s2}"
 
+                # --- [A. Cointegration Test (Engle-Granger)] ---
                 score, p_value, _ = coint(y, x)
 
-                # 🛡️ [修正]：如果是持倉中組合，無視 P-Value > 0.05 的過濾門檻
-                if p_value >= 0.05 and not is_active:
-                    continue
-
+                # --- [B. Regression Parameters (Log-Scale)] ---
                 x_with_const = sm.add_constant(x)
-                ols_result = sm.OLS(y, x_with_const).fit()
+                model = sm.OLS(y, x_with_const).fit()
+                beta = model.params.iloc[1]
+                alpha = model.params.iloc[0]
 
-                alpha = float(ols_result.params.iloc[0])
-                beta = float(ols_result.params.iloc[1])  # Log-Beta (彈性系數)
-
+                # --- [C. Spread & Z-Score Calculation] ---
                 spread = y - (beta * x + alpha)
+                spread_std = spread.std()
+                last_z = spread.iloc[-1] / spread_std
+
+                # --- [D. Dashboard Metric Restoration] ---
+                correlation = y.corr(x)
+                last_p1 = np.exp(y.iloc[-1])  # Restore from Log to Real Price
+                last_p2 = np.exp(x.iloc[-1])
+
+                # --- [E. Half-Life] ---
                 half_life = self.calculate_half_life(spread)
 
-                spread_mean = spread.mean()
-                spread_std = spread.std()
-                # 計算最新 Z-Score 用於監控
-                last_z_score = (spread.iloc[-1] - spread_mean) / spread_std if spread_std != 0 else 0
+                # Active Status Flag
+                is_active = pair_name in active_pairs
 
                 results.append({
                     'timestamp': scan_time,
-                    'pair': pair_name, 's1': sym1, 's2': sym2,
-                    'p_value': float(p_value), 'correlation': float(correlation),
-                    'beta': beta, 'alpha': alpha, 'half_life': float(half_life) if not np.isnan(half_life) else 9999.0,
-                    'last_z_score': float(last_z_score), 'spread_std': float(spread_std),
-                    'last_p1': float(raw_y.iloc[-1]), 'last_p2': float(raw_x.iloc[-1]),
-                    'data_points': data_points,
-                    'is_active': is_active  # 標註是否為強制計算的單位
+                    'pair': pair_name,
+                    's1': s1, 's2': s2,
+                    'p_value': round(float(p_value), 5),
+                    'correlation': round(float(correlation), 4),
+                    'beta': round(float(beta), 4),
+                    'alpha': round(float(alpha), 4),
+                    'spread_std': round(float(spread_std), 6),
+                    'last_z_score': round(float(last_z), 4),  # This is 'current_z'
+                    'half_life': round(float(half_life), 2),
+                    'last_p1': round(float(last_p1), 6),
+                    'last_p2': round(float(last_p2), 6),
+                    'data_points': len(y),
+                    'is_active': is_active
                 })
-            except Exception as e:
+
+            except Exception:
                 continue
 
-        if not results: return None
+        if not results:
+            logger.warning("📡 No valid pairs found in this scan.")
+            return
 
-        # 3. 排序並存檔
-        df_results = pd.DataFrame(results).sort_values(by=['p_value']).reset_index(drop=True)
+        # 3. Sort by P-Value and add Ranking logic
+        df_results = pd.DataFrame(results).sort_values(by='p_value').reset_index(drop=True)
         df_results['rank'] = df_results.index + 1
         df_results['is_top_10'] = df_results['rank'] <= 10
 
-        cols_order = [
-            'timestamp', 'pair', 's1', 's2', 'p_value', 'correlation', 'beta',
-            'alpha', 'half_life', 'last_z_score', 'spread_std', 'last_p1',
-            'last_p2', 'is_top_10', 'rank', 'data_points', 'is_active'
-        ]
-        df_results = df_results[cols_order]
+        # Save to Research Log (Append mode)
+        file_exists = self.log_filepath.exists()
+        df_results.to_csv(self.log_filepath, mode='a', index=False, header=not file_exists)
 
-        file_exists = log_filepath.exists()
-        df_results.to_csv(log_filepath, mode='a', header=not file_exists, index=False)
-        logger.success(f"✅ 掃描完成。已將 {len(df_results)} 組結果寫入 master_research_log.csv")
-        return df_results
+        logger.success(f"✅ Co-integration scan completed. Logged {len(df_results)} pairs (with full dashboard fields).")

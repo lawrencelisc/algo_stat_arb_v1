@@ -8,28 +8,56 @@ from datetime import datetime, timezone
 
 
 class PairMonitor:
-
-    VERSION = "v3.1.0-Stable"
-
-    # 定義路徑 (對齊 algo_stat_arb_v1 架構)
-    root_dir = Path(__file__).resolve().parent.parent
-    result_folder = root_dir / 'result'
-    log_filepath = result_folder / 'master_research_log.csv'
-
-    # 🛡️ 定位攻擊指令存放處
-    signal_folder = root_dir / 'data' / 'signal'
-    signal_table_path = signal_folder / 'signal_table.csv'
+    """
+    [v3.2.1-Safety] Pair Monitor Module
+    Location: /core/pair_monitor.py
+    Responsibility: Real-time Z-Score calculation and Cointegration health guarding.
+    """
+    VERSION = "v3.2.1-Safety"
 
     def __init__(self):
+        # Path definitions
+        self.root_dir = Path(__file__).resolve().parent.parent
+        self.result_folder = self.root_dir / 'result'
+        self.log_filepath = self.result_folder / 'master_research_log.csv'
+
+        # Trade records and Signal paths
+        self.trade_record_path = self.root_dir / 'data' / 'trade' / 'trade_record.csv'
+        self.signal_folder = self.root_dir / 'data' / 'signal'
+        self.signal_table_path = self.signal_folder / 'signal_table.csv'
+
+        # Initialize Exchange (Bybit)
         self.exchange = ccxt.bybit({'enableRateLimit': True})
         self.signal_folder.mkdir(parents=True, exist_ok=True)
-        logger.info('🛰️ PairMonitor scanner deployed with Half-Life & LOG-SCALE support')
+
+        logger.info(f"🛰️ PairMonitor {self.VERSION} Guardian mode online.")
+
+    def get_active_trade_pairs(self):
+        """
+        [Core] Fetch current open positions from local trade records.
+        """
+        if not self.trade_record_path.exists():
+            return []
+        try:
+            df = pd.read_csv(self.trade_record_path)
+            if df.empty:
+                return []
+            # Only track pairs with 'OPEN' status
+            active_pairs = df[df['status'] == 'OPEN']['pair'].unique().tolist()
+            return active_pairs
+        except Exception as e:
+            logger.error(f"❌ Failed to read trade records: {e}")
+            return []
 
     def fetch_latest_prices(self, symbols):
-        """獲取實時報價"""
+        """
+        Fetch real-time prices from exchange and map to CSV symbol format.
+        """
         try:
+            # Map simple symbol (DOGEUSDT) to CCXT format (DOGE/USDT:USDT)
             mapping = {f"{s.replace('USDT', '')}/USDT:USDT": s for s in symbols}
             ccxt_symbols = list(mapping.keys())
+
             tickers = self.exchange.fetch_tickers(ccxt_symbols, params={'category': 'linear'})
 
             prices = {}
@@ -39,71 +67,100 @@ class PairMonitor:
                     prices[csv_key] = float(data['last'])
             return prices
         except Exception as e:
-            logger.error(f"❌ Error fetching prices from Bybit: {e}")
+            logger.error(f"❌ Failed to fetch real-time prices: {e}")
             return {}
 
-    def generate_signal(self, pair_name, s1, s2, z_score, beta, half_life):
-        """
-        [PHASE 1 UPGRADE] 新增 half_life 參數
-        產出指令並傳遞預期壽命數據
-        """
-        if self.signal_table_path.exists():
-            df_existing = pd.read_csv(self.signal_table_path)
-            is_pending = df_existing[(df_existing['pair'] == pair_name) & (df_existing['status'] == 'PENDING')]
-            if not is_pending.empty:
-                return
-
-        side1 = 'BUY' if z_score < -2.0 else 'SELL'
-        side2 = 'SELL' if z_score < -2.0 else 'BUY'
-
-        signal_entry = {
-            'timestamp': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
-            'pair': pair_name,
-            's1': s1, 's2': s2,
-            'side1': side1, 'side2': side2,
-            'z_score': round(z_score, 4),
-            'beta': beta,
-            'half_life': round(half_life, 2),  # <--- 將半衰期數據寫入指令表
-            'status': 'PENDING'
-        }
-
-        df_new = pd.DataFrame([signal_entry])
-        file_exists = self.signal_table_path.exists()
-        df_new.to_csv(self.signal_table_path, mode='a', index=False, header=not file_exists)
-        logger.success(f"🎯 SIGNAL: {pair_name} (Z: {z_score:.2f}, HL: {half_life:.1f}h)")
-
     def check_all_pairs(self):
-        """監控主邏輯"""
+        """
+        [Main Loop] Monitor both Watchlist (opportunities) and Active Trades (safety).
+        """
         if not self.log_filepath.exists():
-            logger.warning(f"⚠️ Research log not found")
+            logger.warning("⚠️ Master research log not found. Monitoring aborted.")
             return
 
         try:
-            df_pairs = pd.read_csv(self.log_filepath)
-            latest_ts = df_pairs['timestamp'].max()
-            df_latest = df_pairs[df_pairs['timestamp'] == latest_ts]
-            watchlist = df_latest[df_latest['p_value'] < 0.05].copy()
+            # 1. Load latest research data (Snapshot from PairScreen)
+            df_all = pd.read_csv(self.log_filepath)
+            if df_all.empty: return
 
-            if watchlist.empty: return
+            latest_ts = df_all['timestamp'].max()
+            df_latest = df_all[df_all['timestamp'] == latest_ts]
 
+            # 2. Identify currently held pairs
+            active_pairs = self.get_active_trade_pairs()
+
+            # 3. Define scope: High-quality opportunities OR current active positions
+            # This ensures "Expired" pairs are still monitored for exit.
+            watchlist = df_latest[
+                (df_latest['p_value'] < 0.05) |
+                (df_latest['pair'].isin(active_pairs))
+                ].copy()
+
+            if watchlist.empty:
+                logger.info("📡 Market is stable. No pairs to monitor.")
+                return
+
+            # 4. Fetch price data for all symbols in scope
             all_needed_symbols = list(set(watchlist['s1'].tolist() + watchlist['s2'].tolist()))
             current_prices = self.fetch_latest_prices(all_needed_symbols)
 
-            for index, row in watchlist.iterrows():
+            signal_data = []
+
+            for _, row in watchlist.iterrows():
+                pair_name = row['pair']
                 s1, s2 = row['s1'], row['s2']
+                p_value = float(row['p_value'])
+
+                # --- [SAFETY GUARD: SIGNAL_EXPIRED] ---
+                # If active but cointegration failed (P-Value >= 0.05)
+                if pair_name in active_pairs and p_value >= 0.05:
+                    logger.critical(f"🚨 {pair_name} relationship broken (P={p_value:.3f})! Forcing exit signal.")
+                    signal_data.append({
+                        'pair': pair_name,
+                        'z_score': 0.0,  # Force Z to zero for exit
+                        'p_value': p_value,
+                        'action': 'FORCE_EXIT_EXPIRED',
+                        'timestamp': datetime.now(timezone.utc).isoformat()
+                    })
+                    continue
+
+                # --- [STANDARD MONITORING] ---
                 if s1 in current_prices and s2 in current_prices:
                     p1, p2 = current_prices[s1], current_prices[s2]
                     beta, alpha, std = float(row['beta']), float(row['alpha']), float(row['spread_std'])
 
-                    # 🎯 絕對核心修復：把抓到的實時價格轉成「對數 (Log)」才能和 Log-Beta 對話！
+                    # Unified Calculation: Log-Scale Z-Score
                     p1_log = np.log(p1)
                     p2_log = np.log(p2)
-
-                    # 現在這裡的單位終於對齊了！
                     z_score = (p1_log - (beta * p2_log + alpha)) / std
-                    pair_name = row['pair']
 
-                    if abs(z_score) >= 2.0:
-                        self.generate_signal(pair_name, s1, s2, z_score, beta, row['half_life'])
+                    signal_data.append({
+                        'pair': pair_name,
+                        'z_score': round(z_score, 4),
+                        'p_value': round(p_value, 4),
+                        'action': 'MONITORING',
+                        'timestamp': datetime.now(timezone.utc).isoformat()
+                    })
+
+            # 5. Output signal table for ExecutionManager
+            if signal_data:
+                pd.DataFrame(signal_data).to_csv(self.signal_table_path, index=False)
+                logger.debug(f"📝 Updated signal table with {len(signal_data)} pairs.")
+
         except Exception as e:
-            logger.error(f"❌ Critical error in monitor: {e}")
+            logger.error(f"❌ Monitoring loop failed: {e}")
+
+    def update_signal_table(self, pair, z_score, p_value, action='MONITORING'):
+        """Manual update helper for specific signals if needed."""
+        try:
+            new_data = {
+                'pair': [pair],
+                'z_score': [z_score],
+                'p_value': [p_value],
+                'action': [action],
+                'timestamp': [datetime.now(timezone.utc).isoformat()]
+            }
+            df = pd.DataFrame(new_data)
+            df.to_csv(self.signal_table_path, mode='a', header=not self.signal_table_path.exists(), index=False)
+        except Exception as e:
+            logger.error(f"❌ Manual signal update failed: {e}")
