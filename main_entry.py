@@ -17,7 +17,7 @@ from utils.execution import ExecutionManager
 # 🛰️ 戰術配置中心
 # ==========================================
 NUM_COINS = 24  # 掃描前 24 名流動性幣種
-BUDGET_PER_PAIR = 150.0  # 每個配對的預算
+BUDGET_PER_PAIR = 20.0   # 小額實盤測試（正式上線後改回 150.0）
 RUN_INTERVAL_MINS = 5  # 核心修正：每 5 分鐘運行一次
 
 ROOT = Path(__file__).resolve().parent
@@ -51,29 +51,32 @@ def frequent_tactical_check():
     包含：市場探測 -> 數據更新 -> 共整合測試 -> 倉位監控與強制平倉
     """
     start_time = time.time()
-    logger.info(f"🚀 [T+{datetime.now().strftime('%M:%S')}] Starting 5-minute tactical check...")
+    logger.info(f"🚀 [{datetime.now().strftime('%H:%M:%S')}] Starting 5-minute tactical check...")
 
     try:
         # 1. 獲取當前持倉信息 (確保 Expired 檢查有名單)
         active_pairs, active_coins = get_active_info()
 
-        # 2. 市場探測：掃描 Top 流動性幣種 + 持倉守護幣種
+        # 2. 市場探測 + OHLCV 下載：Top N 流動性幣種，並強制刷新持倉幣種數據
         ms = MarketScanner()
-        top_coins = ms.get_top_volume_coins(num_coins=NUM_COINS)
+        top_coins = ms.get_top_volume_coins(num_coins=NUM_COINS, force_include=active_coins)
 
-        # 合併清單：確保持倉中的幣種一定會被下載 OHLCV
+        # 合併清單傳給篩選器（數據已在上一步全部更新）
         full_scan_list = list(set(top_coins + active_coins))
         logger.info(f"🛡️ Guardian Mode: Scanning {len(full_scan_list)} symbols in total.")
 
-        # 3. 數據下載與共整合計算 (對數空間轉換與 P-Value 測試)
+        # 3. 共整合篩選 (對數空間轉換與 P-Value 測試)
         pc = PairCombine()
-        pc.pair_screener(full_scan_list, timeframe='1h', active_pairs=active_pairs)
+        df_screened = pc.pair_screener(full_scan_list, timeframe='1h', active_pairs=active_pairs)
+        if df_screened.empty:
+            logger.warning("⚠️ pair_screener 無結果，本輪跳過監控與執行。")
+            return
 
-        # 4. 配對監控 (PairMonitor)：檢查 P-Value 是否失效 (> 0.05)
+        # 4. 配對監控 (PairMonitor)：計算即時 Z-Score，檢查 P-Value 是否失效
         pm = PairMonitor()
         pm.check_all_pairs()
 
-        # 5. 執行管理 (ExecutionManager)：處理根據最新 Z-Score 進行的開平倉
+        # 5. 執行管理 (ExecutionManager)：根據最新 Z-Score 進行開平倉
         em = ExecutionManager(budget_per_pair=BUDGET_PER_PAIR)
         em.execute_trades()
 

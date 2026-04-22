@@ -1,14 +1,19 @@
 [Unit]
-Description=algo_stat_arb_v1
+Description=Algo Stat-Arb v1 - Pair Trading Bot
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
+User=ubuntu
 WorkingDirectory=/usr/local/app/algo_stat_arb_v1
-ExecStart=/usr/local/app/algo_stat_arb_v1/venv/bin/python3.12 main_entry.py
-StandardOutput=syslog
-Restart=always
-RestartSec=2
-User=root
+ExecStart=/usr/local/app/algo_stat_arb_v1/venv/bin/python3 main_entry.py
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=algo_stat_arb_v1
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target

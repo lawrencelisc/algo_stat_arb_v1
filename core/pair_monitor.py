@@ -1,4 +1,3 @@
-import os
 import pandas as pd
 import numpy as np
 import ccxt
@@ -6,13 +5,16 @@ from pathlib import Path
 from loguru import logger
 from datetime import datetime, timezone
 
+STOP_Z = 4.0   # z-score 超過此值視為共整合結構破裂，觸發止損
+
+
 class PairMonitor:
     """
     [v3.2.2-Safety] Pair Monitor Module
     Location: /core/pair_monitor.py
     Responsibility: Real-time Z-Score calculation and Cointegration health guarding.
     """
-    VERSION = "v3.2.2-Safety"
+    VERSION = "v3.4.0-StopLoss"
 
     def __init__(self):
         # Path definitions
@@ -46,7 +48,8 @@ class PairMonitor:
 
     def fetch_latest_prices(self, symbols):
         try:
-            mapping = {f"{s.replace('USDT', '')}/USDT:USDT": s for s in symbols}
+            # 只移除尾部 'USDT'，避免 replace() 誤刪 base 名稱中含 'USDT' 的幣種
+            mapping = {f"{(s[:-4] if s.endswith('USDT') else s)}/USDT:USDT": s for s in symbols}
             ccxt_symbols = list(mapping.keys())
 
             tickers = self.exchange.fetch_tickers(ccxt_symbols, params={'category': 'linear'})
@@ -55,7 +58,12 @@ class PairMonitor:
             for ccxt_id, data in tickers.items():
                 if ccxt_id in mapping:
                     csv_key = mapping[ccxt_id]
-                    prices[csv_key] = float(data['last'])
+                    # last 可能為 None（新上市/停牌），float(None) 會拋 TypeError 導致整批失敗
+                    last = data.get('last')
+                    if last is not None:
+                        prices[csv_key] = float(last)
+                    else:
+                        logger.warning(f"⚠️ No last price for {ccxt_id}, skipping.")
             return prices
         except Exception as e:
             logger.error(f"❌ Failed to fetch real-time prices: {e}")
@@ -67,16 +75,14 @@ class PairMonitor:
             return
 
         try:
-            df_all = pd.read_csv(self.log_filepath)
-            if df_all.empty: return
-
-            latest_ts = df_all['timestamp'].max()
-            df_latest = df_all[df_all['timestamp'] == latest_ts]
+            # master_research_log.csv 現在是覆寫模式，每次只含最新一批結果，直接讀取即可
+            df_latest = pd.read_csv(self.log_filepath)
+            if df_latest.empty: return
 
             active_pairs = self.get_active_trade_pairs()
 
             watchlist = df_latest[
-                (df_latest['p_value'] < 0.05) |
+                (df_latest['p_value'] < 0.03) |
                 (df_latest['pair'].isin(active_pairs))
                 ].copy()
 
@@ -96,13 +102,14 @@ class PairMonitor:
                 beta = float(row['beta'])  # 提取 Beta 值
 
                 # --- [SAFETY GUARD: SIGNAL_EXPIRED] ---
-                if pair_name in active_pairs and p_value >= 0.05:
+                if pair_name in active_pairs and p_value >= 0.03:
                     logger.critical(f"🚨 {pair_name} relationship broken (P={p_value:.3f})! Forcing exit signal.")
                     signal_data.append({
                         'pair': pair_name,
-                        'z_score': 0.0,
+                        # nan 作哨兵值，明確區分 FORCE_EXIT 與正常 z_score=0 的均值狀態
+                        'z_score': float('nan'),
                         'p_value': p_value,
-                        'beta': beta,  # [修復] 補上 beta
+                        'beta': beta,
                         'action': 'FORCE_EXIT_EXPIRED',
                         'timestamp': datetime.now(timezone.utc).isoformat()
                     })
@@ -117,32 +124,52 @@ class PairMonitor:
                     p2_log = np.log(p2)
                     z_score = (p1_log - (beta * p2_log + alpha)) / std
 
+                    # --- [SAFETY GUARD: STOP_LOSS] ---
+                    # z-score 持續擴大超過 STOP_Z，代表 spread 方向性偏離，共整合結構可能已破裂
+                    if pair_name in active_pairs and abs(z_score) >= STOP_Z:
+                        logger.critical(
+                            f"🛑 STOP_LOSS triggered for {pair_name}: z={z_score:.3f} ≥ {STOP_Z}. "
+                            f"Cointegration structure may be broken!"
+                        )
+                        signal_data.append({
+                            'pair': pair_name,
+                            'z_score': round(z_score, 4),
+                            'p_value': round(p_value, 4),
+                            'beta': round(beta, 4),
+                            'action': 'FORCE_EXIT_STOPLOSS',
+                            'timestamp': datetime.now(timezone.utc).isoformat()
+                        })
+                        continue
+
                     signal_data.append({
                         'pair': pair_name,
                         'z_score': round(z_score, 4),
                         'p_value': round(p_value, 4),
-                        'beta': round(beta, 4),  # [修復] 補上 beta，讓執行官能計算雙腿倉位
+                        'beta': round(beta, 4),
                         'action': 'MONITORING',
                         'timestamp': datetime.now(timezone.utc).isoformat()
                     })
 
-            if signal_data:
-                pd.DataFrame(signal_data).to_csv(self.signal_table_path, index=False)
+            # 無論有無信號都覆寫：若 signal_data 為空，清空訊號表
+            # 避免舊週期的 z_score / FORCE_EXIT 殘留，被 ExecutionManager 誤判為有效信號
+            pd.DataFrame(signal_data).to_csv(self.signal_table_path, index=False)
 
         except Exception as e:
             logger.error(f"❌ Monitoring loop failed: {e}")
 
     def update_signal_table(self, pair, z_score, p_value, beta, action='MONITORING'):
+        """手動更新單一配對的訊號，覆寫模式與 check_all_pairs 保持一致，避免舊訊號殘留。"""
         try:
             new_data = {
                 'pair': [pair],
                 'z_score': [z_score],
                 'p_value': [p_value],
-                'beta': [beta],  # [修復] 補上 beta
+                'beta': [beta],
                 'action': [action],
                 'timestamp': [datetime.now(timezone.utc).isoformat()]
             }
             df = pd.DataFrame(new_data)
-            df.to_csv(self.signal_table_path, mode='a', header=not self.signal_table_path.exists(), index=False)
+            # 改為覆寫，與 check_all_pairs 模式一致，防止追加模式堆積舊訊號
+            df.to_csv(self.signal_table_path, mode='w', index=False)
         except Exception as e:
             logger.error(f"❌ Manual signal update failed: {e}")

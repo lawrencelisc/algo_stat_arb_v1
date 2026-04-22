@@ -1,3 +1,4 @@
+import time
 import requests
 from pathlib import Path
 from loguru import logger
@@ -22,7 +23,7 @@ class TelegramReporter:
     負責格式化並發送系統信號、執行結果、異常警報與每日戰報。
     """
 
-    VERSION = "v3.0.0-Stable"
+    VERSION = "v3.1.0-RobustSend"
 
     def __init__(self):
         """
@@ -34,7 +35,11 @@ class TelegramReporter:
 
             self.token = tg_config.get('TOKEN')
             self.chat_id = tg_config.get('GROUP_ID')
-            self.api_url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+            # api_url 只在 token 有效時設置，避免 token=None 時建出無效 URL
+            self.api_url = (
+                f"https://api.telegram.org/bot{self.token}/sendMessage"
+                if self.token else None
+            )
 
             if self.token and self.chat_id:
                 logger.info("📱 Telegram Reporter initialized via DataBridge.")
@@ -44,12 +49,12 @@ class TelegramReporter:
             logger.error(f"❌ Failed to initialize Telegram Reporter: {e}")
             self.token, self.chat_id = None, None
 
-    def _send(self, text):
+    def _send(self, text, _max_retries=3):
         """
-        底層發送邏輯
+        底層發送邏輯，支援 429 Rate Limit 指數退避重試。
         :param text: 發送的文字內容 (支援 Markdown)
         """
-        if not self.token or not self.chat_id:
+        if not self.token or not self.chat_id or not self.api_url:
             return None
 
         payload = {
@@ -58,15 +63,32 @@ class TelegramReporter:
             'parse_mode': 'Markdown'
         }
 
-        try:
-            # 加入 timeout 避免因網路問題卡死主程序
-            response = requests.post(self.api_url, data=payload, timeout=10)
-            if response.status_code != 200:
-                logger.error(f"❌ TG API Error: {response.text}")
-            return response.json()
-        except Exception as e:
-            logger.error(f"🚨 Telegram connection failed: {e}")
-            return None
+        for attempt in range(1, _max_retries + 1):
+            try:
+                response = requests.post(self.api_url, data=payload, timeout=10)
+
+                if response.status_code == 200:
+                    # 只在成功時解析 JSON，避免非 JSON 回應誤觸 JSONDecodeError
+                    return response.json()
+
+                if response.status_code == 429:
+                    # Rate limit：從回應頭取退避秒數，預設指數退避
+                    retry_after = int(response.headers.get('Retry-After', 2 ** attempt))
+                    logger.warning(f"⚠️ TG Rate limited. Retrying in {retry_after}s (attempt {attempt}/{_max_retries})")
+                    time.sleep(retry_after)
+                    continue
+
+                # 其他非 200 錯誤：記錄並不重試
+                logger.error(f"❌ TG API Error [{response.status_code}]: {response.text}")
+                return None
+
+            except Exception as e:
+                logger.error(f"🚨 Telegram connection failed (attempt {attempt}/{_max_retries}): {e}")
+                if attempt < _max_retries:
+                    time.sleep(2 ** attempt)
+
+        logger.error("❌ TG send failed after all retries.")
+        return None
 
     # ==========================================
     # 🎯 訊號觸發通報 (Signal Alert + Beta Drift)
@@ -144,11 +166,11 @@ class TelegramReporter:
     # 💓 週期性「平安信」 (Heartbeat Pulse)
     # ==========================================
     def send_heartbeat(self, pnl, active_pairs, uptime):
-        """確保系統運作正常的定期通報"""
+        """確保系統運作正常的定期通報。pnl 為 USDT 絕對值，與 send_daily_report 語意一致。"""
         msg = (
             f"💓 *HEARTBEAT PULSE*\n"
             f"───────────────────\n"
-            f"📈 *Daily PnL:* '{pnl:+.2%}'\n"
+            f"📈 *Daily PnL:* '{pnl:+.2f} USDT'\n"
             f"📂 *Active Pairs:* '{active_pairs}'\n"
             f"🕒 *Uptime:* '{uptime}'\n"
             f"✅ _System is breathing normally._"
@@ -175,7 +197,7 @@ class TelegramReporter:
             f"───────────────────\n"
             f"🏆 *Win Rate:* '{win_rate:.1%}'\n"
             f"📂 *Active Pairs:* '{active_count}'\n"
-            f"🕒 *Report Time:* {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+            f"🕒 *Report Time:* {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC\n"
             f"🚀 _Stay disciplined, Captain._"
         )
         self._send(msg)

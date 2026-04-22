@@ -66,4 +66,3 @@
     ```
 # algo_stat_arb_v1
 
-# algo_stat_arb_v1
