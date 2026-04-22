@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=ubuntu
+User=root
 WorkingDirectory=/usr/local/app/algo_stat_arb_v1
 ExecStart=/usr/local/app/algo_stat_arb_v1/venv/bin/python3 main_entry.py
 StandardOutput=journal
