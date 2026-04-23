@@ -156,11 +156,11 @@ class ExecutionManager:
                 elif pair in active_pairs and not np.isnan(z) and abs(z) < 0.2:
                     self._close_pair_position(pair, "Z_REVERSION")
                 elif pair not in active_pairs and action == 'MONITORING' and not np.isnan(z):
-                    if z > 3.0:
+                    if z > 2.5:
                         # 開倉成功後立即加入 active_pairs，防止同週期重複開倉
                         if self._open_pair_position(pair, sig, 'SHORT_SPREAD'):
                             active_pairs.append(pair)
-                    elif z < -3.0:
+                    elif z < -2.5:
                         if self._open_pair_position(pair, sig, 'LONG_SPREAD'):
                             active_pairs.append(pair)
         except Exception as e:
