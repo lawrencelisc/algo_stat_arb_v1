@@ -16,9 +16,9 @@ from utils.execution import ExecutionManager
 # ==========================================
 # 🛰️ 戰術配置中心
 # ==========================================
-NUM_COINS = 24  # 掃描前 24 名流動性幣種
-BUDGET_PER_PAIR = 20.0   # 小額實盤測試（正式上線後改回 150.0）
-RUN_INTERVAL_MINS = 5  # 核心修正：每 5 分鐘運行一次
+NUM_COINS         = 24     # 掃描前 24 名流動性幣種
+BUDGET_PER_PAIR   = 110.0  # Paper trade 資金（正式上線後改回 150.0）
+RUN_INTERVAL_MINS = 60     # 每 60 分鐘運行一次（配合 1h K 線）
 
 ROOT = Path(__file__).resolve().parent
 TRADE_RECORD_PATH = ROOT / 'data' / 'trade' / 'trade_record.csv'
@@ -51,7 +51,7 @@ def frequent_tactical_check():
     包含：市場探測 -> 數據更新 -> 共整合測試 -> 倉位監控與強制平倉
     """
     start_time = time.time()
-    logger.info(f"🚀 [{datetime.now().strftime('%H:%M:%S')}] Starting 5-minute tactical check...")
+    logger.info(f"🚀 [{datetime.now().strftime('%H:%M:%S')}] Starting {RUN_INTERVAL_MINS}-minute tactical check...")
 
     try:
         # 1. 獲取當前持倉信息 (確保 Expired 檢查有名單)
@@ -81,7 +81,7 @@ def frequent_tactical_check():
         em.execute_trades()
 
         duration = time.time() - start_time
-        logger.success(f"✅ Tactical check completed in {duration:.1f}s | Next scan in {RUN_INTERVAL_MINS} minutes.")
+        logger.success(f"✅ Tactical check completed in {duration:.1f}s | Next scan in {RUN_INTERVAL_MINS} min.")
 
         # 記憶體清理，防止長時間運行洩漏
         gc.collect()
