@@ -5,7 +5,7 @@ from pathlib import Path
 from loguru import logger
 from datetime import datetime, timezone
 
-STOP_Z = 4.0   # z-score 超過此值視為共整合結構破裂，觸發止損
+STOP_Z = 8.0   # z-score 超過此值視為共整合結構破裂，觸發止損（backtest 最優值）
 
 
 class PairMonitor:
@@ -14,7 +14,7 @@ class PairMonitor:
     Location: /core/pair_monitor.py
     Responsibility: Real-time Z-Score calculation and Cointegration health guarding.
     """
-    VERSION = "v3.4.0-StopLoss"
+    VERSION = "v3.5.0-OptimizedThresholds"
 
     def __init__(self):
         # Path definitions

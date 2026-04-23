@@ -7,18 +7,24 @@ from pathlib import Path
 from loguru import logger
 from datetime import datetime, timezone
 
+# ── 開倉 / 平倉 Z-Score 門檻 ─────────────────────────────
+ENTRY_Z_L1 = 3.0    # Level 1 開倉門檻（首次入場，1.0× 倉位）
+ENTRY_Z_L2 = 4.0    # Level 2 加倉門檻（加碼同方向，0.8× 倉位）
+SIZE_L1    = 1.0    # L1 倉位乘數（×budget）
+SIZE_L2    = 0.8    # L2 倉位乘數（×budget）
+EXIT_Z     = 0.2    # z 絕對值低於此值觸發均值回歸平倉
+
 # ── Limit Order 參數 ─────────────────────────────────────
-LIMIT_TIMEOUT_SEC    = 30   # 掛單最長等待秒數
-LIMIT_CHECK_INTERVAL = 2    # 每隔幾秒查詢一次訂單狀態
-# 限價掛單相對 BBO 的偏移量：買單掛在 ask 內側 1 tick，賣單掛在 bid 內側 1 tick
-LIMIT_OFFSET_PCT     = 0.0001  # 0.01%
+LIMIT_TIMEOUT_SEC    = 30      # 掛單最長等待秒數
+LIMIT_CHECK_INTERVAL = 2       # 每隔幾秒查詢一次訂單狀態
+LIMIT_OFFSET_PCT     = 0.0001  # 掛單相對 BBO 偏移量（0.01%），買在 ask 內側，賣在 bid 內側
 
 
 class ExecutionManager:
     """
     [雙手] Execution Manager: 嚴格執行一多一空與原子撤單
     """
-    VERSION = "v4.1.0-SafeExecution"
+    VERSION = "v4.3.0-OptimizedThresholds"
 
     def __init__(self, budget_per_pair=1500.0):
         self.root_dir = Path(__file__).resolve().parent.parent
@@ -153,29 +159,33 @@ class ExecutionManager:
                 elif action == 'FORCE_EXIT_STOPLOSS' and pair in active_pairs:
                     logger.critical(f"🛑 STOP_LOSS executing for {pair}: z={z:.3f}. Closing position immediately.")
                     self._close_pair_position(pair, "STOP_LOSS")
-                elif pair in active_pairs and not np.isnan(z) and abs(z) < 0.2:
+                elif pair in active_pairs and not np.isnan(z) and abs(z) < EXIT_Z:
                     self._close_pair_position(pair, "Z_REVERSION")
+                elif pair in active_pairs and action == 'MONITORING' and not np.isnan(z):
+                    # L2 加倉：持倉方向一致 且 z 繼續擴大超過 L2 門檻
+                    self._try_add_to_position(pair, sig, z)
                 elif pair not in active_pairs and action == 'MONITORING' and not np.isnan(z):
-                    if z > 2.5:
-                        # 開倉成功後立即加入 active_pairs，防止同週期重複開倉
-                        if self._open_pair_position(pair, sig, 'SHORT_SPREAD'):
+                    if z > ENTRY_Z_L1:
+                        if self._open_pair_position(pair, sig, 'SHORT_SPREAD', SIZE_L1):
                             active_pairs.append(pair)
-                    elif z < -2.5:
-                        if self._open_pair_position(pair, sig, 'LONG_SPREAD'):
+                    elif z < -ENTRY_Z_L1:
+                        if self._open_pair_position(pair, sig, 'LONG_SPREAD', SIZE_L1):
                             active_pairs.append(pair)
         except Exception as e:
             logger.error(f"❌ Execution loop error: {e}")
 
-    def _open_pair_position(self, pair, sig, side):
+    def _open_pair_position(self, pair, sig, side, size_multiplier: float = 1.0):
         """
         開倉：S1 和 S2 均先嘗試限價掛單（Maker 0.01%），
         超時才改市價（Taker 0.06%）。
         S1 成功後 S2 若完全失敗，立即市價回滾 S1，確保原子性。
+        size_multiplier: 實際投入 = budget × size_multiplier。
         成功回傳 True，失敗回傳 False。
         """
         s1, s2 = sig['pair'].split('-')
         beta = abs(float(sig['beta']))
         s1_ccxt, s2_ccxt = self._to_ccxt(s1), self._to_ccxt(s2)
+        alloc = self.budget * size_multiplier
 
         try:
             prices = self.exchange.fetch_tickers([s1_ccxt, s2_ccxt],
@@ -186,8 +196,8 @@ class ExecutionManager:
                 logger.error(f"❌ Cannot fetch prices for {pair}: p1={p1}, p2={p2}. Aborting open.")
                 return False
 
-            qty1 = float(self.exchange.amount_to_precision(s1_ccxt, self.budget / p1))
-            qty2 = float(self.exchange.amount_to_precision(s2_ccxt, (self.budget * beta) / p2))
+            qty1 = float(self.exchange.amount_to_precision(s1_ccxt, alloc / p1))
+            qty2 = float(self.exchange.amount_to_precision(s2_ccxt, (alloc * beta) / p2))
 
             s1_side = 'buy' if side == 'LONG_SPREAD' else 'sell'
             s2_side = 'sell' if side == 'LONG_SPREAD' else 'buy'
@@ -219,6 +229,7 @@ class ExecutionManager:
                 'pair': pair, 's1': s1, 's2': s2, 'status': 'OPEN', 'side': side,
                 'entry_z': sig['z_score'], 'entry_p1': p1, 'entry_p2': p2,
                 'qty1': qty1, 'qty2': qty2, 'beta': beta,
+                'entry_level': 1, 'l2_entry_z': None, 'l2_entry_time': None,
                 'open_fee_type': fee_note,
                 'entry_time': datetime.now(timezone.utc).isoformat()
             }
@@ -229,6 +240,80 @@ class ExecutionManager:
         except Exception as e:
             logger.error(f"❌ Pair open error {pair}: {e}")
             return False
+
+    def _try_add_to_position(self, pair: str, sig, z: float):
+        """
+        Level-2 加倉：當持倉方向與當前 z-score 一致，且 abs(z) >= ENTRY_Z_L2 時，
+        追加 SIZE_L2 × budget 的倉位，更新 CSV 記錄。每筆交易只加一次。
+        """
+        try:
+            if not self.trade_record_path.exists():
+                return
+            df = pd.read_csv(self.trade_record_path)
+            idx = df[(df['pair'] == pair) & (df['status'] == 'OPEN')].index
+            if idx.empty:
+                return
+            trade = df.loc[idx[0]]
+
+            # 只允許從 L1 升至 L2（每筆最多加倉一次）
+            if int(trade.get('entry_level', 1)) >= 2:
+                return
+
+            side = trade['side']
+            # 加倉方向必須與原始持倉一致
+            if side == 'SHORT_SPREAD' and z < ENTRY_Z_L2:
+                return
+            if side == 'LONG_SPREAD' and z > -ENTRY_Z_L2:
+                return
+
+            s1, s2 = trade['s1'], trade['s2']
+            s1_ccxt, s2_ccxt = self._to_ccxt(s1), self._to_ccxt(s2)
+            beta = abs(float(trade['beta']))
+            alloc = self.budget * SIZE_L2
+
+            prices = self.exchange.fetch_tickers([s1_ccxt, s2_ccxt],
+                                                 params={'category': 'linear'})
+            p1 = prices.get(s1_ccxt, {}).get('last')
+            p2 = prices.get(s2_ccxt, {}).get('last')
+            if p1 is None or p2 is None:
+                logger.warning(f"⚠️ L2 add-on skipped for {pair}: cannot fetch prices.")
+                return
+
+            add_qty1 = float(self.exchange.amount_to_precision(s1_ccxt, alloc / p1))
+            add_qty2 = float(self.exchange.amount_to_precision(s2_ccxt, (alloc * beta) / p2))
+
+            s1_side = 'buy' if side == 'LONG_SPREAD' else 'sell'
+            s2_side = 'sell' if side == 'LONG_SPREAD' else 'buy'
+
+            logger.info(f"📈 [L2 ADD] {pair} z={z:.3f} | {s1_side} {add_qty1} S1 / {s2_side} {add_qty2} S2")
+
+            s1_ok, _ = self._try_limit_then_market(s1_ccxt, s1_side, add_qty1)
+            if not s1_ok:
+                logger.error(f"❌ L2 S1 add-on failed for {pair}. Skipping.")
+                return
+
+            s2_ok, _ = self._try_limit_then_market(s2_ccxt, s2_side, add_qty2)
+            if not s2_ok:
+                logger.critical(f"🚨 L2 S2 add-on failed for {pair}! Rolling back L2 S1.")
+                s1_rollback = 'sell' if s1_side == 'buy' else 'buy'
+                try:
+                    self.exchange.create_order(s1_ccxt, 'market', s1_rollback, add_qty1,
+                                               params={'category': 'linear', 'reduceOnly': True})
+                except Exception as e_rb:
+                    logger.critical(f"💀 L2 S1 rollback failed for {pair}: {e_rb}. Manual intervention required!")
+                return
+
+            # 累加持倉數量，升級至 Level 2
+            df.loc[idx[0], 'qty1']         = float(trade['qty1']) + add_qty1
+            df.loc[idx[0], 'qty2']         = float(trade['qty2']) + add_qty2
+            df.loc[idx[0], 'entry_level']  = 2
+            df.loc[idx[0], 'l2_entry_z']   = round(z, 4)
+            df.loc[idx[0], 'l2_entry_time'] = datetime.now(timezone.utc).isoformat()
+            df.to_csv(self.trade_record_path, index=False)
+            logger.success(f"✅ L2 add-on done for {pair} | z={z:.3f} | +qty1={add_qty1} +qty2={add_qty2}")
+
+        except Exception as e:
+            logger.error(f"❌ _try_add_to_position failed for {pair}: {e}")
 
     def _close_pair_position(self, pair, reason):
         try:
