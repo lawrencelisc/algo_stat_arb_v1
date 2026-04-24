@@ -8,11 +8,22 @@ from loguru import logger
 from datetime import datetime, timezone
 
 # ── 開倉 / 平倉 Z-Score 門檻 ─────────────────────────────
-ENTRY_Z_L1 = 3.0    # Level 1 開倉門檻（首次入場，1.0× 倉位）
-ENTRY_Z_L2 = 4.0    # Level 2 加倉門檻（加碼同方向，0.8× 倉位）
+ENTRY_Z_L1 = 2.0    # Level 1 開倉門檻（首次入場，1.0× 倉位）
+ENTRY_Z_L2 = 2.5    # Level 2 加倉門檻（加碼同方向，0.8× 倉位）
+ENTRY_Z_L3 = 3.0    # Level 3 加倉門檻（加碼同方向，0.6× 倉位）
+ENTRY_Z_L4 = 4.0    # Level 4 加倉門檻（加碼同方向，0.4× 倉位）
 SIZE_L1    = 1.0    # L1 倉位乘數（×budget）
 SIZE_L2    = 0.8    # L2 倉位乘數（×budget）
+SIZE_L3    = 0.6    # L3 倉位乘數（×budget）
+SIZE_L4    = 0.4    # L4 倉位乘數（×budget）
 EXIT_Z     = 0.2    # z 絕對值低於此值觸發均值回歸平倉
+
+# 加倉計劃表：(觸發門檻, 倉位乘數, 升級後 entry_level)
+_ADD_ON_LEVELS = [
+    (ENTRY_Z_L2, SIZE_L2, 2),
+    (ENTRY_Z_L3, SIZE_L3, 3),
+    (ENTRY_Z_L4, SIZE_L4, 4),
+]
 
 # ── Limit Order 參數 ─────────────────────────────────────
 LIMIT_TIMEOUT_SEC    = 30      # 掛單最長等待秒數
@@ -243,8 +254,9 @@ class ExecutionManager:
 
     def _try_add_to_position(self, pair: str, sig, z: float):
         """
-        Level-2 加倉：當持倉方向與當前 z-score 一致，且 abs(z) >= ENTRY_Z_L2 時，
-        追加 SIZE_L2 × budget 的倉位，更新 CSV 記錄。每筆交易只加一次。
+        金字塔加倉：L1 開倉後，z 繼續擴大可依序觸發 L2 / L3 / L4。
+        每次只升一級，確保每個門檻最多加倉一次。
+        加倉計劃由模組級常數 _ADD_ON_LEVELS 驅動，新增/調整級別只需改常數。
         """
         try:
             if not self.trade_record_path.exists():
@@ -255,28 +267,33 @@ class ExecutionManager:
                 return
             trade = df.loc[idx[0]]
 
-            # 只允許從 L1 升至 L2（每筆最多加倉一次）
-            if int(trade.get('entry_level', 1)) >= 2:
+            current_level = int(trade.get('entry_level', 1))
+            # 已達最高級，無需再加倉
+            if current_level >= len(_ADD_ON_LEVELS) + 1:
                 return
 
             side = trade['side']
-            # 加倉方向必須與原始持倉一致
-            if side == 'SHORT_SPREAD' and z < ENTRY_Z_L2:
+
+            # 找出下一個應觸發的加倉級別
+            next_threshold, next_size, next_level = _ADD_ON_LEVELS[current_level - 1]
+
+            # 加倉方向必須與原始持倉一致，且 z 須超過該級門檻
+            if side == 'SHORT_SPREAD' and z < next_threshold:
                 return
-            if side == 'LONG_SPREAD' and z > -ENTRY_Z_L2:
+            if side == 'LONG_SPREAD' and z > -next_threshold:
                 return
 
             s1, s2 = trade['s1'], trade['s2']
             s1_ccxt, s2_ccxt = self._to_ccxt(s1), self._to_ccxt(s2)
             beta = abs(float(trade['beta']))
-            alloc = self.budget * SIZE_L2
+            alloc = self.budget * next_size
 
             prices = self.exchange.fetch_tickers([s1_ccxt, s2_ccxt],
                                                  params={'category': 'linear'})
             p1 = prices.get(s1_ccxt, {}).get('last')
             p2 = prices.get(s2_ccxt, {}).get('last')
             if p1 is None or p2 is None:
-                logger.warning(f"⚠️ L2 add-on skipped for {pair}: cannot fetch prices.")
+                logger.warning(f"⚠️ L{next_level} add-on skipped for {pair}: cannot fetch prices.")
                 return
 
             add_qty1 = float(self.exchange.amount_to_precision(s1_ccxt, alloc / p1))
@@ -285,32 +302,32 @@ class ExecutionManager:
             s1_side = 'buy' if side == 'LONG_SPREAD' else 'sell'
             s2_side = 'sell' if side == 'LONG_SPREAD' else 'buy'
 
-            logger.info(f"📈 [L2 ADD] {pair} z={z:.3f} | {s1_side} {add_qty1} S1 / {s2_side} {add_qty2} S2")
+            logger.info(f"📈 [L{next_level} ADD] {pair} z={z:.3f} | {s1_side} {add_qty1} S1 / {s2_side} {add_qty2} S2")
 
             s1_ok, _ = self._try_limit_then_market(s1_ccxt, s1_side, add_qty1)
             if not s1_ok:
-                logger.error(f"❌ L2 S1 add-on failed for {pair}. Skipping.")
+                logger.error(f"❌ L{next_level} S1 add-on failed for {pair}. Skipping.")
                 return
 
             s2_ok, _ = self._try_limit_then_market(s2_ccxt, s2_side, add_qty2)
             if not s2_ok:
-                logger.critical(f"🚨 L2 S2 add-on failed for {pair}! Rolling back L2 S1.")
+                logger.critical(f"🚨 L{next_level} S2 add-on failed for {pair}! Rolling back S1.")
                 s1_rollback = 'sell' if s1_side == 'buy' else 'buy'
                 try:
                     self.exchange.create_order(s1_ccxt, 'market', s1_rollback, add_qty1,
                                                params={'category': 'linear', 'reduceOnly': True})
                 except Exception as e_rb:
-                    logger.critical(f"💀 L2 S1 rollback failed for {pair}: {e_rb}. Manual intervention required!")
+                    logger.critical(f"💀 L{next_level} S1 rollback failed for {pair}: {e_rb}. Manual intervention required!")
                 return
 
-            # 累加持倉數量，升級至 Level 2
-            df.loc[idx[0], 'qty1']         = float(trade['qty1']) + add_qty1
-            df.loc[idx[0], 'qty2']         = float(trade['qty2']) + add_qty2
-            df.loc[idx[0], 'entry_level']  = 2
-            df.loc[idx[0], 'l2_entry_z']   = round(z, 4)
+            # 累加持倉數量，升級至下一 level
+            df.loc[idx[0], 'qty1']          = float(trade['qty1']) + add_qty1
+            df.loc[idx[0], 'qty2']          = float(trade['qty2']) + add_qty2
+            df.loc[idx[0], 'entry_level']   = next_level
+            df.loc[idx[0], 'l2_entry_z']    = round(z, 4)
             df.loc[idx[0], 'l2_entry_time'] = datetime.now(timezone.utc).isoformat()
             df.to_csv(self.trade_record_path, index=False)
-            logger.success(f"✅ L2 add-on done for {pair} | z={z:.3f} | +qty1={add_qty1} +qty2={add_qty2}")
+            logger.success(f"✅ L{next_level} add-on done for {pair} | z={z:.3f} | +qty1={add_qty1} +qty2={add_qty2}")
 
         except Exception as e:
             logger.error(f"❌ _try_add_to_position failed for {pair}: {e}")

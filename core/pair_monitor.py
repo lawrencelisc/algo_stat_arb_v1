@@ -69,7 +69,16 @@ class PairMonitor:
             logger.error(f"❌ Failed to fetch real-time prices: {e}")
             return {}
 
+    _SIGNAL_COLS = ['pair', 'z_score', 'p_value', 'beta', 'action', 'timestamp']
+
+    def _clear_signal_table(self):
+        """每次 check_all_pairs 進入時先清空訊號表，防止 stale signal 殘留被 ExecutionManager 誤讀。"""
+        pd.DataFrame(columns=self._SIGNAL_COLS).to_csv(self.signal_table_path, index=False)
+
     def check_all_pairs(self):
+        # 無論後續走哪條路，先清空訊號表，確保本輪若無法完整更新時 execution 不會讀到舊訊號
+        self._clear_signal_table()
+
         if not self.log_filepath.exists():
             logger.warning("⚠️ Master research log not found. Monitoring aborted.")
             return
