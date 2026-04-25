@@ -117,12 +117,18 @@ class PairCombine:
                 # Z-Score 正規化
                 last_z = (spread.iloc[-1] - spread.mean()) / spread_std if spread_std != 0 else 0
 
+                half_life = self.calculate_half_life(spread)
+
+                # 🛡️ 鐵血防線 4：當前 Z-Score 絕對值 > 3.5 代表 spread 極度偏離，
+                # 共整合結構可能已破裂，非活躍持倉一律過濾
+                if abs(last_z) > 3.5 and not is_active: continue
+
                 results.append({
                     'timestamp': scan_time, 'pair': pair_name, 's1': s1, 's2': s2,
                     'p_value': round(float(p_value), 5), 'correlation': round(float(correlation), 4),
                     'beta': round(float(beta), 4), 'alpha': round(float(alpha), 4),
                     'spread_std': round(float(spread_std), 6), 'last_z_score': round(float(last_z), 4),
-                    'half_life': round(self.calculate_half_life(spread), 2),
+                    'half_life': round(half_life, 2),
                     'last_p1': round(np.exp(y.iloc[-1]), 6), 'last_p2': round(np.exp(x.iloc[-1]), 6),
                     'data_points': len(y), 'is_active': is_active
                 })
@@ -135,12 +141,14 @@ class PairCombine:
 
         df_results = pd.DataFrame(results).sort_values(by='p_value').reset_index(drop=True)
         df_results['rank'] = df_results.index + 1
-        df_results['is_top_10'] = df_results['rank'] <= 20
+        df_results['is_shortlisted'] = df_results['rank'] <= 20
 
         # 覆寫最新結果（PairMonitor 直接讀此檔，無需 timestamp 過濾，不會無限膨脹）
         df_results.to_csv(self.log_filepath, mode='w', index=False)
         # 追加至 history 供研究分析，與實時監控分離
-        df_results.to_csv(self.history_filepath, mode='a', index=False, header=not self.history_filepath.exists())
+        # 用 stat().st_size > 0 確保即使文件存在但為空，也能正確補上 header
+        need_header = not (self.history_filepath.exists() and self.history_filepath.stat().st_size > 0)
+        df_results.to_csv(self.history_filepath, mode='a', index=False, header=need_header)
 
         logger.success(f"✅ 篩選完成！獲得 {len(df_results)} 對「高純度正相關」組合。")
         return df_results

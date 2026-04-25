@@ -91,7 +91,7 @@ class PairMonitor:
             active_pairs = self.get_active_trade_pairs()
 
             watchlist = df_latest[
-                (df_latest['p_value'] < 0.03) |
+                (df_latest['p_value'] < 0.05) |
                 (df_latest['pair'].isin(active_pairs))
                 ].copy()
 

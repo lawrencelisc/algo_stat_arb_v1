@@ -244,8 +244,9 @@ class ExecutionManager:
                 'open_fee_type': fee_note,
                 'entry_time': datetime.now(timezone.utc).isoformat()
             }
+            need_header = not (self.trade_record_path.exists() and self.trade_record_path.stat().st_size > 0)
             pd.DataFrame([new_trade]).to_csv(self.trade_record_path, mode='a',
-                                             header=not self.trade_record_path.exists(), index=False)
+                                             header=need_header, index=False)
             logger.success(f"✅ Market Neutral Position opened for {pair} ({fee_note})")
             return True
         except Exception as e:
