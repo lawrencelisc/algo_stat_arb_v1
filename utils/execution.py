@@ -110,7 +110,7 @@ class ExecutionManager:
             deadline = time.time() + LIMIT_TIMEOUT_SEC
             while time.time() < deadline:
                 time.sleep(LIMIT_CHECK_INTERVAL)
-                status = self.exchange.fetch_order(order_id, symbol, params={'category': 'linear'})
+                status = self.exchange.fetch_order(order_id, symbol, params={'category': 'linear', 'acknowledged': True})
                 if status['status'] == 'closed':
                     logger.success(f"✅ Limit filled (Maker): {symbol} {direction} {qty} @ {price}")
                     return True, 'maker'
