@@ -95,7 +95,7 @@ class PairCombine:
                 # 🛡️ 鐵血防線 1：用 log returns 計算相關性，避免 level 序列的偽相關
                 # NaN 守衛：標準差為 0 時 corr() 回傳 NaN，NaN < 0.65 == False 會意外通過
                 correlation = y.diff().corr(x.diff())
-                if (pd.isna(correlation) or correlation < 0.65) and not is_active: continue
+                if (pd.isna(correlation) or correlation < 0.60) and not is_active: continue
 
                 x_with_const = sm.add_constant(x)
                 model = sm.OLS(y, x_with_const).fit()
@@ -109,7 +109,7 @@ class PairCombine:
                 # 若改用 min(p_yx, p_xy)，可能用 x~y 方向通過篩選，
                 # 但 spread 仍按 y~x 方向計算，導致 spread 未必平穩
                 _, p_value, _ = coint(y, x)
-                if p_value >= 0.03 and not is_active: continue
+                if p_value >= 0.05 and not is_active: continue
 
                 alpha = model.params.iloc[0]
                 spread = y - (beta * x + alpha)
@@ -135,7 +135,7 @@ class PairCombine:
 
         df_results = pd.DataFrame(results).sort_values(by='p_value').reset_index(drop=True)
         df_results['rank'] = df_results.index + 1
-        df_results['is_top_10'] = df_results['rank'] <= 10
+        df_results['is_top_10'] = df_results['rank'] <= 20
 
         # 覆寫最新結果（PairMonitor 直接讀此檔，無需 timestamp 過濾，不會無限膨脹）
         df_results.to_csv(self.log_filepath, mode='w', index=False)

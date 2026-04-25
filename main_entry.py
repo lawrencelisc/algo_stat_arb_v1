@@ -24,7 +24,6 @@ ROOT = Path(__file__).resolve().parent
 TRADE_RECORD_PATH = ROOT / 'data' / 'trade' / 'trade_record.csv'
 LOG_FILEPATH      = ROOT / 'result' / 'master_research_log.csv'
 
-
 def get_active_info():
     """
     提取持倉 Pair 名單與所涉及的單幣名單
