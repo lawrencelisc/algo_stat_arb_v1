@@ -322,6 +322,7 @@ class ExecutionManager:
                 return
 
             # 累加持倉數量，升級至下一 level
+            df['l2_entry_time'] = df['l2_entry_time'].astype(object)
             df.loc[idx[0], 'qty1']          = float(trade['qty1']) + add_qty1
             df.loc[idx[0], 'qty2']          = float(trade['qty2']) + add_qty2
             df.loc[idx[0], 'entry_level']   = next_level
