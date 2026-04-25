@@ -75,6 +75,31 @@ class ExecutionManager:
         clean = symbol[:-4] if symbol.endswith('USDT') else symbol
         return f"{clean}/USDT:USDT"
 
+    @staticmethod
+    def _limit_price_from_ob5(ob: dict, direction: str) -> float:
+        """
+        用 top-5 order book levels 計算 VWAP，作為限價單參考基準。
+
+        Buy  → 取 asks 前 5 層 VWAP，再向內偏移 LIMIT_OFFSET_PCT（略低於 VWAP）
+        Sell → 取 bids 前 5 層 VWAP，再向內偏移 LIMIT_OFFSET_PCT（略高於 VWAP）
+
+        相比只用 Level-1 BBO：
+          - 參考價格更穩定，不會被單一薄層帶偏
+          - 掛單位置落在市場實際流動性重心，填單率更高
+          - 5 層 VWAP 通常介於 L1 價格與 L5 價格之間，掛單比純 L1 更積極
+        """
+        levels = ob['asks'][:5] if direction == 'buy' else ob['bids'][:5]
+        if not levels:
+            raise ValueError(f"Order book has no {'ask' if direction == 'buy' else 'bid'} levels")
+
+        total_qty   = sum(qty for _, qty in levels)
+        vwap        = sum(px * qty for px, qty in levels) / total_qty if total_qty > 0 else levels[0][0]
+
+        if direction == 'buy':
+            return vwap * (1 - LIMIT_OFFSET_PCT)
+        else:
+            return vwap * (1 + LIMIT_OFFSET_PCT)
+
     def _set_pair_leverage(self, s1_ccxt: str, s2_ccxt: str) -> bool:
         """
         開倉前為兩腿設定相同 leverage，確保保證金比率對稱。
@@ -102,19 +127,12 @@ class ExecutionManager:
         """
         order_id = None
         try:
-            # 取 top-3 order book 確認流動性，並用 Level-1 定價
-            ob = self.exchange.fetch_order_book(symbol, limit=3, params={'category': 'linear'})
+            ob = self.exchange.fetch_order_book(symbol, limit=5, params={'category': 'linear'})
             if not ob['bids'] or not ob['asks']:
                 raise ValueError(f"Empty order book for {symbol}")
 
-            if direction == 'buy':
-                # 掛在 best ask 內側，略低於 ask → 成為 maker
-                raw_price = ob['asks'][0][0] * (1 - LIMIT_OFFSET_PCT)
-            else:
-                # 掛在 best bid 內側，略高於 bid → 成為 maker
-                raw_price = ob['bids'][0][0] * (1 + LIMIT_OFFSET_PCT)
-
-            price = float(self.exchange.price_to_precision(symbol, raw_price))
+            price = float(self.exchange.price_to_precision(
+                symbol, self._limit_price_from_ob5(ob, direction)))
 
             order = self.exchange.create_order(
                 symbol, 'limit', direction, qty, price,
@@ -184,25 +202,23 @@ class ExecutionManager:
         s1_done = s2_done = False
 
         try:
-            # ── Phase 1: 掛兩個限價單 ──────────────────────────────
-            ob1 = self.exchange.fetch_order_book(s1_ccxt, limit=3, params={'category': 'linear'})
+            # ── Phase 1: 掛兩個限價單（top-5 VWAP 定價）──────────
+            ob1 = self.exchange.fetch_order_book(s1_ccxt, limit=5, params={'category': 'linear'})
             if not ob1['bids'] or not ob1['asks']:
                 raise ValueError(f"Empty order book for {s1_ccxt}")
-            raw1 = (ob1['asks'][0][0] * (1 - LIMIT_OFFSET_PCT) if s1_side == 'buy'
-                    else ob1['bids'][0][0] * (1 + LIMIT_OFFSET_PCT))
-            s1_price = float(self.exchange.price_to_precision(s1_ccxt, raw1))
+            s1_price = float(self.exchange.price_to_precision(
+                s1_ccxt, self._limit_price_from_ob5(ob1, s1_side)))
             o1 = self.exchange.create_order(
                 s1_ccxt, 'limit', s1_side, s1_qty, s1_price,
                 params={'category': 'linear', 'timeInForce': 'GTC'})
             s1_id = o1['id']
             logger.info(f"📋 [{label}] Limit placed: {s1_ccxt} {s1_side} {s1_qty} @ {s1_price} (id={s1_id})")
 
-            ob2 = self.exchange.fetch_order_book(s2_ccxt, limit=3, params={'category': 'linear'})
+            ob2 = self.exchange.fetch_order_book(s2_ccxt, limit=5, params={'category': 'linear'})
             if not ob2['bids'] or not ob2['asks']:
                 raise ValueError(f"Empty order book for {s2_ccxt}")
-            raw2 = (ob2['asks'][0][0] * (1 - LIMIT_OFFSET_PCT) if s2_side == 'buy'
-                    else ob2['bids'][0][0] * (1 + LIMIT_OFFSET_PCT))
-            s2_price = float(self.exchange.price_to_precision(s2_ccxt, raw2))
+            s2_price = float(self.exchange.price_to_precision(
+                s2_ccxt, self._limit_price_from_ob5(ob2, s2_side)))
             o2 = self.exchange.create_order(
                 s2_ccxt, 'limit', s2_side, s2_qty, s2_price,
                 params={'category': 'linear', 'timeInForce': 'GTC'})
