@@ -30,12 +30,15 @@ LIMIT_TIMEOUT_SEC    = 30      # 掛單最長等待秒數
 LIMIT_CHECK_INTERVAL = 2       # 每隔幾秒查詢一次訂單狀態
 LIMIT_OFFSET_PCT     = 0.0001  # 掛單相對 BBO 偏移量（0.01%），買在 ask 內側，賣在 bid 內側
 
+# ── Leverage 設定 ─────────────────────────────────────────
+PAIR_LEVERAGE = 10             # 雙腿統一 leverage（必須在 Bybit 允許範圍內）
+
 
 class ExecutionManager:
     """
     [雙手] Execution Manager: 嚴格執行一多一空與原子撤單
     """
-    VERSION = "v4.3.0-OptimizedThresholds"
+    VERSION = "v4.4.0-ParallelLegs"
 
     def __init__(self, budget_per_pair=1500.0):
         self.root_dir = Path(__file__).resolve().parent.parent
@@ -71,6 +74,20 @@ class ExecutionManager:
         # 只移除尾部 USDT，避免 replace() 誤截 base 名稱中含 USDT 的幣種
         clean = symbol[:-4] if symbol.endswith('USDT') else symbol
         return f"{clean}/USDT:USDT"
+
+    def _set_pair_leverage(self, s1_ccxt: str, s2_ccxt: str) -> bool:
+        """
+        開倉前為兩腿設定相同 leverage，確保保證金比率對稱。
+        任一腿失敗即回傳 False，阻止開倉。
+        """
+        for sym in (s1_ccxt, s2_ccxt):
+            try:
+                self.exchange.set_leverage(PAIR_LEVERAGE, sym, params={'category': 'linear'})
+                logger.info(f"⚙️ Leverage set: {sym} → {PAIR_LEVERAGE}x")
+            except Exception as e:
+                logger.error(f"❌ Failed to set leverage for {sym}: {e}")
+                return False
+        return True
 
     def _try_limit_then_market(self, symbol: str, direction: str, qty: float) -> tuple[bool, str]:
         """
@@ -143,6 +160,117 @@ class ExecutionManager:
                     pass
             return False, None
 
+    def _execute_pair(
+        self,
+        s1_ccxt: str, s1_side: str, s1_qty: float,
+        s2_ccxt: str, s2_side: str, s2_qty: float,
+        label: str = "",
+    ) -> tuple[bool, str | None, bool, str | None]:
+        """
+        並行雙腿執行：兩腿共用同一個 deadline，大幅壓縮腿風險窗口。
+
+        流程：
+          Phase 1 — 順序掛兩個限價單（< 1s，避免 CCXT 單實例多線程競爭）
+          Phase 2 — 統一輪詢：兩腿共用同一個 LIMIT_TIMEOUT_SEC deadline
+          Phase 3 — 超時後同時取消剩餘掛單，再順序發市價兜底
+
+        最壞情況腿風險窗口：~30s（共享等待）+ ~2s（市價），vs 舊版 ~60s。
+        回傳：(s1_ok, s1_fee_type, s2_ok, s2_fee_type)
+        """
+        s1_id = s2_id = None
+        s1_price = s2_price = None
+        s1_fee: str | None = None
+        s2_fee: str | None = None
+        s1_done = s2_done = False
+
+        try:
+            # ── Phase 1: 掛兩個限價單 ──────────────────────────────
+            ob1 = self.exchange.fetch_order_book(s1_ccxt, limit=3, params={'category': 'linear'})
+            if not ob1['bids'] or not ob1['asks']:
+                raise ValueError(f"Empty order book for {s1_ccxt}")
+            raw1 = (ob1['asks'][0][0] * (1 - LIMIT_OFFSET_PCT) if s1_side == 'buy'
+                    else ob1['bids'][0][0] * (1 + LIMIT_OFFSET_PCT))
+            s1_price = float(self.exchange.price_to_precision(s1_ccxt, raw1))
+            o1 = self.exchange.create_order(
+                s1_ccxt, 'limit', s1_side, s1_qty, s1_price,
+                params={'category': 'linear', 'timeInForce': 'GTC'})
+            s1_id = o1['id']
+            logger.info(f"📋 [{label}] Limit placed: {s1_ccxt} {s1_side} {s1_qty} @ {s1_price} (id={s1_id})")
+
+            ob2 = self.exchange.fetch_order_book(s2_ccxt, limit=3, params={'category': 'linear'})
+            if not ob2['bids'] or not ob2['asks']:
+                raise ValueError(f"Empty order book for {s2_ccxt}")
+            raw2 = (ob2['asks'][0][0] * (1 - LIMIT_OFFSET_PCT) if s2_side == 'buy'
+                    else ob2['bids'][0][0] * (1 + LIMIT_OFFSET_PCT))
+            s2_price = float(self.exchange.price_to_precision(s2_ccxt, raw2))
+            o2 = self.exchange.create_order(
+                s2_ccxt, 'limit', s2_side, s2_qty, s2_price,
+                params={'category': 'linear', 'timeInForce': 'GTC'})
+            s2_id = o2['id']
+            logger.info(f"📋 [{label}] Limit placed: {s2_ccxt} {s2_side} {s2_qty} @ {s2_price} (id={s2_id})")
+
+            # ── Phase 2: 統一輪詢（共享 deadline）──────────────────
+            deadline = time.time() + LIMIT_TIMEOUT_SEC
+            while time.time() < deadline:
+                time.sleep(LIMIT_CHECK_INTERVAL)
+
+                if not s1_done and s1_id:
+                    st1 = self.exchange.fetch_order(s1_id, s1_ccxt,
+                                                    params={'category': 'linear', 'acknowledged': True})
+                    if st1['status'] == 'closed':
+                        s1_fee, s1_done, s1_id = 'maker', True, None
+                        logger.success(f"✅ [{label}] Maker filled: {s1_ccxt} {s1_side} {s1_qty} @ {s1_price}")
+                    elif st1['status'] in ('canceled', 'rejected', 'expired'):
+                        s1_id = None  # 外部取消，Phase 3 改市價
+
+                if not s2_done and s2_id:
+                    st2 = self.exchange.fetch_order(s2_id, s2_ccxt,
+                                                    params={'category': 'linear', 'acknowledged': True})
+                    if st2['status'] == 'closed':
+                        s2_fee, s2_done, s2_id = 'maker', True, None
+                        logger.success(f"✅ [{label}] Maker filled: {s2_ccxt} {s2_side} {s2_qty} @ {s2_price}")
+                    elif st2['status'] in ('canceled', 'rejected', 'expired'):
+                        s2_id = None
+
+                if s1_done and s2_done:
+                    break
+
+            # ── Phase 3: 取消剩餘掛單，市價兜底 ────────────────────
+            for done, oid, sym, side, qty, attr in [
+                (s1_done, s1_id, s1_ccxt, s1_side, s1_qty, 's1'),
+                (s2_done, s2_id, s2_ccxt, s2_side, s2_qty, 's2'),
+            ]:
+                if done:
+                    continue
+                if oid:
+                    logger.warning(f"⏰ [{label}] Limit timeout {sym}. Cancelling → market.")
+                    try:
+                        self.exchange.cancel_order(oid, sym, params={'category': 'linear'})
+                    except Exception:
+                        pass
+                try:
+                    self.exchange.create_order(sym, 'market', side, qty,
+                                               params={'category': 'linear'})
+                    logger.info(f"✅ [{label}] Market fallback filled: {sym} {side} {qty}")
+                    if attr == 's1':
+                        s1_fee, s1_done = 'taker', True
+                    else:
+                        s2_fee, s2_done = 'taker', True
+                except Exception as e_mkt:
+                    logger.error(f"❌ [{label}] Market fallback failed {sym}: {e_mkt}")
+
+            return s1_done, s1_fee, s2_done, s2_fee
+
+        except Exception as e:
+            logger.error(f"❌ [{label}] _execute_pair failed: {e}")
+            for oid, sym in [(s1_id, s1_ccxt), (s2_id, s2_ccxt)]:
+                if oid:
+                    try:
+                        self.exchange.cancel_order(oid, sym, params={'category': 'linear'})
+                    except Exception:
+                        pass
+            return s1_done, None, s2_done, None
+
     def get_open_positions(self):
         if not self.trade_record_path.exists(): return pd.DataFrame()
         try:
@@ -199,6 +327,11 @@ class ExecutionManager:
         alloc = self.budget * size_multiplier
 
         try:
+            # ── 開倉前先確保兩腿 leverage 一致 ───────────────────
+            if not self._set_pair_leverage(s1_ccxt, s2_ccxt):
+                logger.error(f"❌ Leverage setup failed for {pair}. Aborting open.")
+                return False
+
             prices = self.exchange.fetch_tickers([s1_ccxt, s2_ccxt],
                                                  params={'category': 'linear'})
             p1 = prices.get(s1_ccxt, {}).get('last')
@@ -213,18 +346,27 @@ class ExecutionManager:
             s1_side = 'buy' if side == 'LONG_SPREAD' else 'sell'
             s2_side = 'sell' if side == 'LONG_SPREAD' else 'buy'
 
-            logger.info(f"🚀 [EXEC] {side} {pair} | S1:{s1_side} {qty1} @ limit | S2:{s2_side} {qty2} @ limit")
+            s1_notional = qty1 * p1
+            s2_notional = qty2 * p2
+            logger.info(
+                f"🚀 [EXEC] {side} {pair} | "
+                f"S1:{s1_side} {qty1} (${s1_notional:.1f}) | "
+                f"S2:{s2_side} {qty2} (${s2_notional:.1f}) | "
+                f"beta={beta:.3f} net=${abs(s2_notional - s1_notional):.1f}"
+            )
 
-            # ── S1：限價優先，超時改市價 ──────────────────────
-            s1_ok, s1_fee_type = self._try_limit_then_market(s1_ccxt, s1_side, qty1)
-            if not s1_ok:
-                logger.error(f"❌ S1 open failed for {pair}. Aborting.")
+            # ── 並行雙腿：同時掛限價，共用 deadline ────────────
+            s1_ok, s1_fee_type, s2_ok, s2_fee_type = self._execute_pair(
+                s1_ccxt, s1_side, qty1,
+                s2_ccxt, s2_side, qty2,
+                label=f"OPEN {pair}",
+            )
+
+            if not s1_ok and not s2_ok:
+                logger.error(f"❌ Both legs failed for {pair}. Aborting.")
                 return False
 
-            # ── S2：限價優先，超時改市價 ──────────────────────
-            s2_ok, s2_fee_type = self._try_limit_then_market(s2_ccxt, s2_side, qty2)
-            if not s2_ok:
-                # S1 已開倉，S2 失敗 → 立即市價回滾 S1
+            if s1_ok and not s2_ok:
                 logger.critical(f"🚨 S2 open failed for {pair}! Rolling back S1 with market order.")
                 s1_rollback = 'sell' if s1_side == 'buy' else 'buy'
                 try:
@@ -233,6 +375,17 @@ class ExecutionManager:
                     logger.info(f"↩️ S1 rollback succeeded for {pair}.")
                 except Exception as e_rb:
                     logger.critical(f"💀 S1 rollback failed for {pair}: {e_rb}. Manual intervention required!")
+                return False
+
+            if not s1_ok and s2_ok:
+                logger.critical(f"🚨 S1 open failed for {pair}! Rolling back S2 with market order.")
+                s2_rollback = 'buy' if s2_side == 'sell' else 'sell'
+                try:
+                    self.exchange.create_order(s2_ccxt, 'market', s2_rollback, qty2,
+                                               params={'category': 'linear', 'reduceOnly': True})
+                    logger.info(f"↩️ S2 rollback succeeded for {pair}.")
+                except Exception as e_rb:
+                    logger.critical(f"💀 S2 rollback failed for {pair}: {e_rb}. Manual intervention required!")
                 return False
 
             fee_note = f"S1={s1_fee_type} S2={s2_fee_type}"
@@ -305,13 +458,18 @@ class ExecutionManager:
 
             logger.info(f"📈 [L{next_level} ADD] {pair} z={z:.3f} | {s1_side} {add_qty1} S1 / {s2_side} {add_qty2} S2")
 
-            s1_ok, _ = self._try_limit_then_market(s1_ccxt, s1_side, add_qty1)
-            if not s1_ok:
-                logger.error(f"❌ L{next_level} S1 add-on failed for {pair}. Skipping.")
+            # ── 並行雙腿加倉：共用 deadline ────────────────────
+            s1_ok, _, s2_ok, _ = self._execute_pair(
+                s1_ccxt, s1_side, add_qty1,
+                s2_ccxt, s2_side, add_qty2,
+                label=f"L{next_level} ADD {pair}",
+            )
+
+            if not s1_ok and not s2_ok:
+                logger.error(f"❌ L{next_level} both legs failed for {pair}. Skipping.")
                 return
 
-            s2_ok, _ = self._try_limit_then_market(s2_ccxt, s2_side, add_qty2)
-            if not s2_ok:
+            if s1_ok and not s2_ok:
                 logger.critical(f"🚨 L{next_level} S2 add-on failed for {pair}! Rolling back S1.")
                 s1_rollback = 'sell' if s1_side == 'buy' else 'buy'
                 try:
@@ -319,6 +477,16 @@ class ExecutionManager:
                                                params={'category': 'linear', 'reduceOnly': True})
                 except Exception as e_rb:
                     logger.critical(f"💀 L{next_level} S1 rollback failed for {pair}: {e_rb}. Manual intervention required!")
+                return
+
+            if not s1_ok and s2_ok:
+                logger.critical(f"🚨 L{next_level} S1 add-on failed for {pair}! Rolling back S2.")
+                s2_rollback = 'buy' if s2_side == 'sell' else 'sell'
+                try:
+                    self.exchange.create_order(s2_ccxt, 'market', s2_rollback, add_qty2,
+                                               params={'category': 'linear', 'reduceOnly': True})
+                except Exception as e_rb:
+                    logger.critical(f"💀 L{next_level} S2 rollback failed for {pair}: {e_rb}. Manual intervention required!")
                 return
 
             # 累加持倉數量，升級至下一 level
